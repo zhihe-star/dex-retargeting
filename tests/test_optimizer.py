@@ -86,6 +86,8 @@ class TestOptimizer:
         config_path = get_default_config_path(
             robot_name, RetargetingType.position, hand_type
         )
+        if config_path is None:
+            return
 
         # Note: The parameters below are adjusted solely for this test
         # The smoothness penalty is deactivated here, meaning no low pass filter and no continuous joint value

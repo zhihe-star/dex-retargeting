@@ -27,13 +27,14 @@ class SingleHandDetector:
     def __init__(
         self,
         hand_type="Right",
+        max_num_hands=1,
         min_detection_confidence=0.8,
         min_tracking_confidence=0.8,
         selfie=False,
     ):
         self.hand_detector = mp.solutions.hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
+            max_num_hands=max_num_hands,
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
@@ -78,18 +79,23 @@ class SingleHandDetector:
 
         return image
 
-    def detect(self, rgb):
+    def detect(self, rgb, return_meta: bool = False):
         results = self.hand_detector.process(rgb)
         if not results.multi_hand_landmarks:
+            if return_meta:
+                return 0, None, None, None, {}
             return 0, None, None, None
 
         desired_hand_num = -1
+        label = None
         for i in range(len(results.multi_hand_landmarks)):
             label = results.multi_handedness[i].ListFields()[0][1][0].label
             if label == self.detected_hand_type:
                 desired_hand_num = i
                 break
         if desired_hand_num < 0:
+            if return_meta:
+                return 0, None, None, None, {}
             return 0, None, None, None
 
         keypoint_3d = results.multi_hand_world_landmarks[desired_hand_num]
@@ -97,11 +103,29 @@ class SingleHandDetector:
         num_box = len(results.multi_hand_landmarks)
 
         # Parse 3d keypoint from MediaPipe hand detector
-        keypoint_3d_array = self.parse_keypoint_3d(keypoint_3d)
-        keypoint_3d_array = keypoint_3d_array - keypoint_3d_array[0:1, :]
+        raw_keypoint_3d_array = self.parse_keypoint_3d(keypoint_3d)
+        keypoint_3d_array = raw_keypoint_3d_array - raw_keypoint_3d_array[0:1, :]
+        palm_frame_points, palm_frame, palm_frame_info = self.normalize_to_palm_frame(
+            raw_keypoint_3d_array
+        )
         mediapipe_wrist_rot = self.estimate_frame_from_hand_points(keypoint_3d_array)
         joint_pos = keypoint_3d_array @ mediapipe_wrist_rot @ self.operator2mano
 
+        if return_meta:
+            return (
+                num_box,
+                joint_pos,
+                keypoint_2d,
+                mediapipe_wrist_rot,
+                {
+                    "handedness": label,
+                    "raw_landmarks": keypoint_3d_array,
+                    "operator_landmarks": joint_pos,
+                    "palm_frame_landmarks": palm_frame_points,
+                    "palm_frame": palm_frame,
+                    "palm_frame_info": palm_frame_info,
+                },
+            )
         return num_box, joint_pos, keypoint_2d, mediapipe_wrist_rot
 
     @staticmethod
@@ -156,3 +180,54 @@ class SingleHandDetector:
             z *= -1
         frame = np.stack([x, normal, z], axis=1)
         return frame
+
+    @staticmethod
+    def _safe_normalize(vector: np.ndarray, fallback: np.ndarray) -> tuple[np.ndarray, bool]:
+        norm = np.linalg.norm(vector)
+        if norm < 1e-8:
+            fallback_norm = np.linalg.norm(fallback)
+            if fallback_norm < 1e-8:
+                return np.array([1.0, 0.0, 0.0]), False
+            return fallback / fallback_norm, False
+        return vector / norm, True
+
+    @staticmethod
+    def normalize_to_palm_frame(keypoint_3d_array: np.ndarray):
+        """Return wrist-centered landmarks in an explicit palm frame.
+
+        Palm-frame axes are:
+        x: palm normal, y: index-to-pinky spread, z: finger-forward.
+        This keeps z mostly along the fingers so the existing x2 ref transform
+        can map [z, x, y] into the robot target-vector frame.
+        """
+        centered = keypoint_3d_array - keypoint_3d_array[0:1, :]
+
+        spread_raw = centered[5] - centered[17]
+        spread, spread_ok = SingleHandDetector._safe_normalize(
+            spread_raw, np.array([0.0, 1.0, 0.0])
+        )
+
+        forward_raw = centered[9]
+        forward_projected = forward_raw - float(np.dot(forward_raw, spread)) * spread
+        forward, forward_ok = SingleHandDetector._safe_normalize(
+            forward_projected, np.array([0.0, 0.0, 1.0])
+        )
+
+        normal_raw = np.cross(spread, forward)
+        normal, normal_ok = SingleHandDetector._safe_normalize(
+            normal_raw, np.array([1.0, 0.0, 0.0])
+        )
+
+        # Re-orthogonalize spread after the normal/forward pair is stable.
+        spread = np.cross(forward, normal)
+        spread, reorthogonalized_spread_ok = SingleHandDetector._safe_normalize(
+            spread, np.array([0.0, 1.0, 0.0])
+        )
+
+        frame = np.stack([normal, spread, forward], axis=1)
+        palm_points = centered @ frame
+        return palm_points, frame, {
+            "spread_ok": spread_ok and reorthogonalized_spread_ok,
+            "forward_ok": forward_ok,
+            "normal_ok": normal_ok,
+        }

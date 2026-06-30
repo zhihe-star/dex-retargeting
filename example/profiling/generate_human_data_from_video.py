@@ -9,14 +9,15 @@ from dex_retargeting.constants import HandType
 from example.vector_retargeting.single_hand_detector import SingleHandDetector
 
 
-def detect_video(video_path: str, output_path: str, is_right: bool):
+def detect_video(video_path: str, output_path: str, hand_type: HandType):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
         print("Error: Could not open video file.")
     else:
         data = []
-        detector = SingleHandDetector(hand_type="Right", selfie=False)
+        hand_label = "Right" if hand_type is HandType.right else "Left"
+        detector = SingleHandDetector(hand_type=hand_label, selfie=False)
         length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         with tqdm.tqdm(total=length) as pbar:
             while cap.isOpened():
@@ -55,7 +56,7 @@ def main(
             to another left robot hand, and the same applies for the right hand.
     """
 
-    detect_video(video_path, output_path, is_right=HandType.right == hand_type)
+    detect_video(video_path, output_path, hand_type=hand_type)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ class RobotName(enum.Enum):
     ability = enum.auto()
     inspire = enum.auto()
     panda = enum.auto()
+    x2 = enum.auto()
 
 
 class RetargetingType(enum.Enum):
@@ -52,6 +53,7 @@ ROBOT_NAME_MAP = {
     RobotName.ability: "ability_hand",
     RobotName.inspire: "inspire_hand",
     RobotName.panda: "panda_gripper",
+    RobotName.x2: "x2_hand",
 }
 
 ROBOT_NAMES = list(ROBOT_NAME_MAP.keys())
@@ -78,7 +80,8 @@ def get_default_config_path(
             config_name = f"{robot_name_str}_{hand_type_str}_dexpilot.yml"
         else:
             config_name = f"{robot_name_str}_{hand_type_str}.yml"
-    return config_path / config_name
+    config_path = config_path / config_name
+    return config_path if config_path.exists() else None
 
 
 OPERATOR2MANO = {

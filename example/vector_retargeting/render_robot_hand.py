@@ -15,6 +15,21 @@ from dex_retargeting.retargeting_config import RetargetingConfig
 # ffmpeg -i teaser.mp4 -vcodec libwebp -lossless 1 -loop 0 -preset default  -an -vsync 0 teaser.webp
 
 
+def get_robot_dir() -> Path:
+    project_root = Path(__file__).absolute().parent.parent.parent
+    robot_dir = project_root / "assets" / "robots" / "hands"
+    return robot_dir if robot_dir.exists() else project_root
+
+
+def is_x2_robot(robot_name: str) -> bool:
+    return "x^2" in robot_name or "x2" in robot_name
+
+
+def get_x2_upright_pose(z: float = -0.05) -> sapien.Pose:
+    # Finger direction: local +X -> world +Z. Palm direction: local +Y -> world +X.
+    return sapien.Pose([0, 0, z], [0.5, -0.5, -0.5, -0.5])
+
+
 def render_by_sapien(
     meta_data: Dict,
     data: List[Union[List[float], np.ndarray]],
@@ -90,6 +105,8 @@ def render_by_sapien(
         loader.scale = 1.4
     elif "shadow" in robot_name:
         loader.scale = 0.9
+    elif is_x2_robot(robot_name):
+        loader.scale = 1.2
     elif "bhand" in robot_name:
         loader.scale = 1.5
     elif "leap" in robot_name:
@@ -98,7 +115,8 @@ def render_by_sapien(
         loader.scale = 1.5
 
     if "glb" not in robot_name:
-        filepath = str(filepath).replace(".urdf", "_glb.urdf")
+        glb_filepath = filepath.with_name(f"{filepath.stem}_glb{filepath.suffix}")
+        filepath = str(glb_filepath if glb_filepath.exists() else filepath)
     else:
         filepath = str(filepath)
     robot = loader.load(filepath)
@@ -107,6 +125,8 @@ def render_by_sapien(
         robot.set_pose(sapien.Pose([0, 0, -0.15]))
     elif "shadow" in robot_name:
         robot.set_pose(sapien.Pose([0, 0, -0.2]))
+    elif is_x2_robot(robot_name):
+        robot.set_pose(get_x2_upright_pose(-0.05))
     elif "dclaw" in robot_name:
         robot.set_pose(sapien.Pose([0, 0, -0.15]))
     elif "allegro" in robot_name:
@@ -170,9 +190,7 @@ def main(
             By default, it is set to None, implying no video will be saved.
         headless: Set to visualize the rendering on the screen by opening the viewer window.
     """
-    robot_dir = (
-        Path(__file__).absolute().parent.parent.parent / "assets" / "robots" / "hands"
-    )
+    robot_dir = get_robot_dir()
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
 
     pickle_data = np.load(pickle_path, allow_pickle=True)

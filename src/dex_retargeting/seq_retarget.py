@@ -155,6 +155,8 @@ class SeqRetargeting:
         self.last_qpos = self.joint_limits.mean(1).astype(np.float32)
         self.num_retargeting = 0
         self.accumulated_time = 0
+        if self.filter is not None:
+            self.filter.reset()
 
     @property
     def joint_names(self):

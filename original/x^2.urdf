@@ -1,0 +1,472 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="robot">
+  <link name="rh_palm">
+    <inertial>
+      <origin xyz="0.15 0 0" rpy="0 0 0" />
+      <mass value="0.3180618649" />
+      <inertia ixx="0.001195530174" ixy="0" ixz="0" iyy="0.03227978945" iyz="0" izz="0.03242107108" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_palm.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_palm.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_lfproximal">
+    <inertial>
+      <origin xyz="0.01834716462 -1.379241439e-06 -0.004517837428" rpy="0 0 0" />
+      <mass value="0.01053437174" />
+      <inertia ixx="5.53513587e-07" ixy="-8.671341423e-12" ixz="-1.923763193e-08" iyy="1.51516565e-06" iyz="2.002153998e-10" izz="1.44162459e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_ffproximal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_ffproximal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_rfproximal">
+    <inertial>
+      <origin xyz="0.01834723912 -1.38170094e-06 -0.004517848138" rpy="0 0 0" />
+      <mass value="0.01053437076" />
+      <inertia ixx="5.535075616e-07" ixy="-8.026385112e-12" ixz="-1.924445314e-08" iyy="1.5151154e-06" iyz="2.000941912e-10" izz="1.441577979e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_mfproximal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_mfproximal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_mfproximal">
+    <inertial>
+      <origin xyz="0.01832839847 -1.270731445e-06 -0.004520273302" rpy="0 0 0" />
+      <mass value="0.01054553347" />
+      <inertia ixx="5.536451795e-07" ixy="1.212097089e-11" ixz="-1.970329322e-08" iyy="1.51876111e-06" iyz="2.027503443e-10" izz="1.445237785e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_rfproximal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_rfproximal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_ffproximal">
+    <inertial>
+      <origin xyz="0.01834727824 -1.380725394e-06 -0.004517853726" rpy="0 0 0" />
+      <mass value="0.01053437475" />
+      <inertia ixx="5.535043215e-07" ixy="-8.993028544e-12" ixz="-1.925417337e-08" iyy="1.515095164e-06" iyz="2.001374344e-10" izz="1.441561608e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_lfproximal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_lfproximal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_lfmiddle">
+    <inertial>
+      <origin xyz="0.01563064009 -1.499574182e-06 -0.003880199278" rpy="0 0 0" />
+      <mass value="0.00608443395" />
+      <inertia ixx="3.44923194e-07" ixy="-3.201276744e-11" ixz="1.804647809e-08" iyy="8.746395679e-07" iyz="1.919170205e-11" izz="7.919985592e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_ffmiddle.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_ffmiddle.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_rfmiddle">
+    <inertial>
+      <origin xyz="0.01563056931 -1.503832323e-06 -0.003880199278" rpy="0 0 0" />
+      <mass value="0.006084434362" />
+      <inertia ixx="3.449256383e-07" ixy="-3.222409839e-11" ixz="1.805008765e-08" iyy="8.746476396e-07" iyz="1.917808273e-11" izz="7.920042435e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_mfmiddle.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_mfmiddle.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_mfmiddle">
+    <inertial>
+      <origin xyz="0.01561129838 -1.500426492e-06 -0.003889072221" rpy="0 0 0" />
+      <mass value="0.006092110017" />
+      <inertia ixx="3.447481731e-07" ixy="-3.18903931e-11" ixz="1.718228759e-08" iyy="8.762175412e-07" iyz="1.923802784e-11" izz="7.938772342e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_rfmiddle.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_rfmiddle.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_ffmiddle">
+    <inertial>
+      <origin xyz="0.01561129838 -1.495515107e-06 -0.003889092477" rpy="0 0 0" />
+      <mass value="0.006092109813" />
+      <inertia ixx="3.447470647e-07" ixy="-3.193985354e-11" ixz="1.717913278e-08" iyy="8.762172001e-07" iyz="1.933975029e-11" izz="7.938779163e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_lfmiddle.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_lfmiddle.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_thbase">
+    <inertial>
+      <origin xyz="0.004994519055 1.252827315e-05 0.009482768364" rpy="0 0 0" />
+      <mass value="0.005947493567" />
+      <inertia ixx="4.122149448e-07" ixy="-4.162856171e-11" ixz="-3.586291086e-08" iyy="6.013219718e-07" iyz="-3.439742935e-11" izz="6.350577451e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thbase.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thbase.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_thproximal">
+    <inertial>
+      <origin xyz="0.01833529957 -0.0001334291737 1.261911507e-06" rpy="1.570796327 0 0" />
+      <mass value="0.01054745909" />
+      <inertia ixx="5.546888815e-07" ixy="1.799688176e-11" ixz="1.945180372e-08" iyy="1.518615818e-06" iyz="1.721046222e-10" izz="1.444056807e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796327 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thproximal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796327 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thproximal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_lfdistal">
+    <inertial>
+      <origin xyz="0.01713174395 6.947018119e-05 -0.004585568793" rpy="0 0 0" />
+      <mass value="0.006851329222" />
+      <inertia ixx="2.64528353e-07" ixy="4.313861268e-09" ixz="-1.36668632e-08" iyy="7.709820693e-07" iyz="-2.010937639e-09" izz="7.866856322e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_ffdistal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_ffdistal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_rfdistal">
+    <inertial>
+      <origin xyz="0.0171317663 6.947452493e-05 -0.004585566465" rpy="0 0 0" />
+      <mass value="0.006851332908" />
+      <inertia ixx="2.645285235e-07" ixy="4.313693402e-09" ixz="-1.366680635e-08" iyy="7.709741112e-07" iyz="-2.01099315e-09" izz="7.866783562e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_mfdistal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_mfdistal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_mfdistal">
+    <inertial>
+      <origin xyz="0.01713179611 6.947166548e-05 -0.004585565068" rpy="0 0 0" />
+      <mass value="0.006851328116" />
+      <inertia ixx="2.645276709e-07" ixy="4.313117419e-09" ixz="-1.366743163e-08" iyy="7.709722922e-07" iyz="-2.011064204e-09" izz="7.866765372e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_rfdistal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_rfdistal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_ffdistal">
+    <inertial>
+      <origin xyz="0.01713179797 6.946863869e-05 -0.004585561343" rpy="0 0 0" />
+      <mass value="0.006851326867" />
+      <inertia ixx="2.645277277e-07" ixy="4.313577939e-09" ixz="-1.366748847e-08" iyy="7.709681995e-07" iyz="-2.011068201e-09" izz="7.866722171e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_lfdistal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_lfdistal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_thmiddle">
+    <inertial>
+      <origin xyz="0.01561127976 0.0004985209089 1.72222849e-06" rpy="1.570796327 0 0" />
+      <mass value="0.006092257402" />
+      <inertia ixx="3.450416557e-07" ixy="3.525722769e-11" ixz="-1.826525953e-08" iyy="8.765251778e-07" iyz="1.930058544e-12" izz="7.938930366e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796327 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thmiddle.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796327 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thmiddle.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="rh_thdistal">
+    <inertial>
+      <origin xyz="0.01713164523 6.780333206e-05 -6.947365182e-05" rpy="1.570796327 0 0" />
+      <mass value="0.006851395322" />
+      <inertia ixx="2.676808322e-07" ixy="-4.314834268e-09" ixz="-3.598990883e-09" iyy="7.741552963e-07" iyz="-1.318083864e-09" izz="7.867088243e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.570796327 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thdistal.stl" />
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.570796327 0 0" />
+      <geometry>
+        <mesh filename="meshes/rh_thdistal.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rh_LFJ3" type="revolute">
+    <parent link="rh_palm" />
+    <child link="rh_lfproximal" />
+    <origin xyz="0.31817731 -0.00011419 -0.0415548" rpy="-0.0000039 0.34016429 -0.0000013" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_RFJ3" type="revolute">
+    <parent link="rh_palm" />
+    <child link="rh_rfproximal" />
+    <origin xyz="0.32655673 -0.00011409 -0.01449892" rpy="-0.00000373 0.17451052 -6.5e-7" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_MFJ3" type="revolute">
+    <parent link="rh_palm" />
+    <child link="rh_mfproximal" />
+    <origin xyz="0.32875964 -0.00011398 0.01438472" rpy="-0.00000367 -0.00000367 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_FFJ3" type="revolute">
+    <parent link="rh_palm" />
+    <child link="rh_ffproximal" />
+    <origin xyz="0.32404697 -0.00011388 0.04333449" rpy="-0.00000376 -0.20946188 7.8e-7" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_LFJ2" type="revolute">
+    <parent link="rh_lfproximal" />
+    <child link="rh_lfmiddle" />
+    <origin xyz="0.03699997 0 0" rpy="0 -2e-8 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_RFJ2" type="revolute">
+    <parent link="rh_rfproximal" />
+    <child link="rh_rfmiddle" />
+    <origin xyz="0.03699998 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_MFJ2" type="revolute">
+    <parent link="rh_mfproximal" />
+    <child link="rh_mfmiddle" />
+    <origin xyz="0.03699998 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_FFJ2" type="revolute">
+    <parent link="rh_ffproximal" />
+    <child link="rh_ffmiddle" />
+    <origin xyz="0.03699998 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_THJ4" type="revolute">
+    <parent link="rh_palm" />
+    <child link="rh_thbase" />
+    <origin xyz="0.2637272 -0.00001394 0.02701175" rpy="-0.00000519 -0.78542057 0.00000367" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.74" upper="1.74" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_THJ3" type="revolute">
+    <parent link="rh_thbase" />
+    <child link="rh_thproximal" />
+    <origin xyz="0.01799998 0 0.01070001" rpy="3.673205103e-06 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_LFJ1" type="revolute">
+    <parent link="rh_lfmiddle" />
+    <child link="rh_lfdistal" />
+    <origin xyz="0.02800002 0 0" rpy="0 -2e-8 0" />
+    <axis xyz="0 0 1" />
+    <mimic joint="rh_LFJ2" multiplier="1.0" offset="0.0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_RFJ1" type="revolute">
+    <parent link="rh_rfmiddle" />
+    <child link="rh_rfdistal" />
+    <origin xyz="0.02800001 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <mimic joint="rh_RFJ2" multiplier="1.0" offset="0.0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_MFJ1" type="revolute">
+    <parent link="rh_mfmiddle" />
+    <child link="rh_mfdistal" />
+    <origin xyz="0.028 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <mimic joint="rh_MFJ2" multiplier="1.0" offset="0.0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_FFJ1" type="revolute">
+    <parent link="rh_ffmiddle" />
+    <child link="rh_ffdistal" />
+    <origin xyz="0.02799999 0 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <mimic joint="rh_FFJ2" multiplier="1.0" offset="0.0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_THJ2" type="revolute">
+    <parent link="rh_thproximal" />
+    <child link="rh_thmiddle" />
+    <origin xyz="0.03700001 0 -1e-08" rpy="2.600205103e-06 0 -2.6e-06" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <joint name="rh_THJ1" type="revolute">
+    <parent link="rh_thmiddle" />
+    <child link="rh_thdistal" />
+    <origin xyz="0.02799998 0 -2e-08" rpy="2.600205103e-06 0 -6.27e-06" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.308997" upper="1.308997" effort="10" velocity="1" />
+  </joint>
+  <link name="rh_lftip" />
+  <joint name="rh_LFtip" type="fixed">
+    <parent link="rh_lfdistal" />
+    <child link="rh_lftip" />
+    <origin xyz="0.034 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="rh_rftip" />
+  <joint name="rh_RFtip" type="fixed">
+    <parent link="rh_rfdistal" />
+    <child link="rh_rftip" />
+    <origin xyz="0.034 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="rh_mftip" />
+  <joint name="rh_MFtip" type="fixed">
+    <parent link="rh_mfdistal" />
+    <child link="rh_mftip" />
+    <origin xyz="0.034 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="rh_fftip" />
+  <joint name="rh_FFtip" type="fixed">
+    <parent link="rh_ffdistal" />
+    <child link="rh_fftip" />
+    <origin xyz="0.034 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="rh_thtip" />
+  <joint name="rh_THtip" type="fixed">
+    <parent link="rh_thdistal" />
+    <child link="rh_thtip" />
+    <origin xyz="0.034 0 0" rpy="0 0 0" />
+  </joint>
+</robot>

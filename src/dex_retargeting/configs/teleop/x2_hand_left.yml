@@ -1,0 +1,27 @@
+retargeting:
+  type: vector
+  urdf_path: ../../../../original/x^2.urdf
+
+  # The x2 URDF only contains rh_* names. Left-hand mode reuses the same
+  # kinematics; the runtime control mode handles the root pose and output
+  # bending side instead of treating this as a second mirrored robot hand.
+  # rh_FFJ1/rh_MFJ1/rh_RFJ1/rh_LFJ1 are mimic joints in this URDF.
+  target_joint_names: [ "rh_FFJ3", "rh_MFJ3", "rh_RFJ3", "rh_LFJ3",
+                        "rh_FFJ2", "rh_MFJ2", "rh_RFJ2", "rh_LFJ2",
+                        "rh_THJ4", "rh_THJ3", "rh_THJ2", "rh_THJ1" ]
+  target_origin_link_names: [ "rh_palm", "rh_thbase", "rh_thproximal", "rh_thmiddle",
+                              "rh_palm", "rh_palm", "rh_palm", "rh_palm", "rh_palm",
+                              "rh_palm", "rh_palm", "rh_palm", "rh_palm", "rh_palm" ]
+  # x2 physical order in this URDF: FF=index, MF=middle, RF=ring, LF=pinky.
+  # Thumb CMC uses wrist->thumb_cmc for THJ4 opposition.
+  # Thumb basal flexion uses thumb_cmc->thumb_mcp for THJ3 flexion/extension.
+  # Thumb MCP/IP use local thumb segment vectors so THJ2/THJ1 can move independently.
+  target_task_link_names: [ "rh_thbase", "rh_thproximal", "rh_thmiddle", "rh_thtip",
+                            "rh_thtip", "rh_fftip", "rh_mftip", "rh_rftip", "rh_lftip",
+                            "rh_thmiddle", "rh_ffmiddle", "rh_mfmiddle", "rh_rfmiddle", "rh_lfmiddle" ]
+  scaling_factor: 3.0
+
+  target_link_human_indices: [ [ 0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ],
+                               [ 1, 2, 3, 4, 4, 8, 12, 16, 20, 3, 6, 10, 14, 18 ] ]
+
+  low_pass_alpha: 0.5

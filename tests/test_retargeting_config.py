@@ -14,6 +14,8 @@ VECTOR_CONFIG_DICT = {
     "leap_right": "teleop/leap_hand_right.yml",
     "ability_right": "teleop/ability_hand_right.yml",
     "ability_left": "teleop/ability_hand_left.yml",
+    "x2_right": "teleop/x2_hand_right.yml",
+    "x2_left": "teleop/x2_hand_left.yml",
 }
 POSITION_CONFIG_DICT = {
     "allegro_right": "offline/allegro_hand_right.yml",
@@ -21,6 +23,8 @@ POSITION_CONFIG_DICT = {
     "svh_right": "offline/schunk_svh_hand_right.yml",
     "leap_right": "offline/leap_hand_right.yml",
     "ability_right": "offline/ability_hand_right.yml",
+    "x2_right": "offline/x2_hand_right.yml",
+    "x2_left": "offline/x2_hand_left.yml",
 }
 DEXPILOT_CONFIG_DICT = {
     "allegro_right": "teleop/allegro_hand_right_dexpilot.yml",
@@ -28,6 +32,8 @@ DEXPILOT_CONFIG_DICT = {
     "shadow_right": "teleop/shadow_hand_right_dexpilot.yml",
     "svh_right": "teleop/schunk_svh_hand_right_dexpilot.yml",
     "leap_right": "teleop/leap_hand_right_dexpilot.yml",
+    "x2_right": "teleop/x2_hand_right_dexpilot.yml",
+    "x2_left": "teleop/x2_hand_left_dexpilot.yml",
 }
 
 ROBOT_NAMES = list(VECTOR_CONFIG_DICT.keys())

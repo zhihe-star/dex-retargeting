@@ -1,0 +1,21 @@
+retargeting:
+  type: position
+  urdf_path: ../../../../original/x^2.urdf
+
+  # rh_FFJ1/rh_MFJ1/rh_RFJ1/rh_LFJ1 are mimic joints in this URDF.
+  target_joint_names: [ "rh_FFJ3", "rh_MFJ3", "rh_RFJ3", "rh_LFJ3",
+                        "rh_FFJ2", "rh_MFJ2", "rh_RFJ2", "rh_LFJ2",
+                        "rh_THJ4", "rh_THJ3", "rh_THJ2", "rh_THJ1" ]
+  # x2 physical order in this URDF: FF=index, MF=middle, RF=ring, LF=pinky.
+  # rh_thbase follows MediaPipe thumb_cmc for THJ4 opposition.
+  # rh_thproximal follows MediaPipe thumb_mcp for THJ3 basal flexion.
+  target_link_names: [ "rh_thbase", "rh_thproximal",
+                       "rh_thtip", "rh_fftip", "rh_mftip", "rh_rftip", "rh_lftip",
+                       "rh_thmiddle", "rh_ffmiddle", "rh_mfmiddle", "rh_rfmiddle", "rh_lfmiddle" ]
+
+  target_link_human_indices: [ 1, 2, 4, 8, 12, 16, 20, 3, 6, 10, 14, 18 ]
+  add_dummy_free_joint: True
+
+  # A smaller alpha means stronger filtering, i.e. more smooth but also larger latency.
+  # 1 means no filter while 0 means not moving.
+  low_pass_alpha: 1

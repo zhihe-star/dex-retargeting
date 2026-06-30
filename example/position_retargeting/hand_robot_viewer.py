@@ -45,6 +45,10 @@ class RobotHandDatasetSAPIENViewer(HandDatasetSAPIENViewer):
             config_path = get_default_config_path(
                 robot_name, RetargetingType.position, hand_type
             )
+            if config_path is None:
+                raise ValueError(
+                    f"No config for {robot_name.name} position {hand_type.name}."
+                )
 
             # Add 6-DoF dummy joint at the root of each robot to make them move freely in the space
             override = dict(add_dummy_free_joint=True)
@@ -57,7 +61,9 @@ class RobotHandDatasetSAPIENViewer(HandDatasetSAPIENViewer):
             # Build robot
             urdf_path = Path(config.urdf_path)
             if "glb" not in urdf_path.stem:
-                urdf_path = urdf_path.with_stem(urdf_path.stem + "_glb")
+                glb_urdf_path = urdf_path.with_stem(urdf_path.stem + "_glb")
+                if glb_urdf_path.exists():
+                    urdf_path = glb_urdf_path
             robot_urdf = urdf.URDF.load(
                 str(urdf_path), add_dummy_free_joints=True, build_scene_graph=False
             )

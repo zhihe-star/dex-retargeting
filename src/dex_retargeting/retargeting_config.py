@@ -63,7 +63,7 @@ class RetargetingConfig:
     low_pass_alpha: float = 0.1
 
     _TYPE = ["vector", "position", "dexpilot"]
-    _DEFAULT_URDF_DIR = "./"
+    _DEFAULT_URDF_DIR = Path("./")
 
     def __post_init__(self):
         # Retargeting type check
@@ -126,7 +126,7 @@ class RetargetingConfig:
         # URDF path check
         urdf_path = Path(self.urdf_path)
         if not urdf_path.is_absolute():
-            urdf_path = self._DEFAULT_URDF_DIR / urdf_path
+            urdf_path = Path(self._DEFAULT_URDF_DIR) / urdf_path
             urdf_path = urdf_path.absolute()
         if not urdf_path.exists():
             raise ValueError(f"URDF path {urdf_path} does not exist")
@@ -137,7 +137,7 @@ class RetargetingConfig:
         path = Path(urdf_dir)
         if not path.exists():
             raise ValueError(f"URDF dir {urdf_dir} not exists.")
-        cls._DEFAULT_URDF_DIR = urdf_dir
+        cls._DEFAULT_URDF_DIR = path
 
     @classmethod
     def load_from_file(
@@ -149,7 +149,11 @@ class RetargetingConfig:
 
         with path.open("r") as f:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
-            cfg = yaml_config["retargeting"]
+            cfg = dict(yaml_config["retargeting"])
+            urdf_path = Path(cfg["urdf_path"])
+            config_relative_urdf_path = path.parent / urdf_path
+            if not urdf_path.is_absolute() and config_relative_urdf_path.exists():
+                cfg["urdf_path"] = str(config_relative_urdf_path.absolute())
             return cls.from_dict(cfg, override)
 
     @classmethod
