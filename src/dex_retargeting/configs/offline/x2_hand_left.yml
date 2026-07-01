@@ -2,8 +2,9 @@ retargeting:
   type: position
   urdf_path: ../../../../original/x^2.urdf
 
-  # The current x2 URDF only contains rh_* names. Left-hand hardware output
-  # should mirror the joint signs after retargeting.
+  # The current x2 URDF only contains rh_* names. Left-hand mode reuses the
+  # same root pose, joint names, and joint limits; runtime control maps
+  # four-finger flexion to negative qpos for left_mode.
   # rh_FFJ1/rh_MFJ1/rh_RFJ1/rh_LFJ1 are mimic joints in this URDF.
   target_joint_names: [ "rh_FFJ3", "rh_MFJ3", "rh_RFJ3", "rh_LFJ3",
                         "rh_FFJ2", "rh_MFJ2", "rh_RFJ2", "rh_LFJ2",

@@ -18,7 +18,6 @@ from dex_retargeting.constants import (
     HandType,
     get_default_config_path,
 )
-from dex_retargeting.kinematics_adaptor import KinematicAdaptor
 from dex_retargeting.retargeting_config import RetargetingConfig
 from single_hand_detector import SingleHandDetector
 
@@ -52,26 +51,16 @@ def is_x2_robot(robot_name: str) -> bool:
     return "x^2" in robot_name or "x2" in robot_name
 
 
-X2_RIGHT_ROOT_QUAT = (0.5, -0.5, -0.5, -0.5)
-X2_LEFT_ROOT_QUAT = (0.5, 0.5, -0.5, 0.5)
+X2_ROOT_QUAT = (0.5, -0.5, -0.5, -0.5)
 
 
 def get_x2_upright_pose(z: float = -0.05, hand_type: str = "Right") -> sapien.Pose:
-    # Finger direction: local +X -> world +Z. Right palm local +Y -> world +X;
-    # left palm local +Y -> world -X.
-    quat = X2_LEFT_ROOT_QUAT if hand_type == "Left" else X2_RIGHT_ROOT_QUAT
-    return sapien.Pose([0, 0, z], quat)
+    # X2 left/right modes share the same URDF and root orientation.
+    return sapien.Pose([0, 0, z], X2_ROOT_QUAT)
 
 
-X2_LEFT_JOINT_SIGN = (
-    "fingers=-1,"
-    "rh_THJ4=-1,"
-    "rh_THJ3=-1,"
-    "rh_THJ2=1,"
-    "rh_THJ1=1"
-)
 X2_FOUR_FINGER_JOINT_TOKENS = ("_FFJ", "_MFJ", "_RFJ", "_LFJ")
-X2_LEFT_LANDMARK_MIRROR = np.array([-1.0, 1.0, 1.0], dtype=np.float32)
+X2_LEFT_PALM_FRAME_ADAPTER = np.array([-1.0, 1.0, 1.0], dtype=np.float32)
 X2_LANDMARK_SEMANTIC_MAP = (
     "thumb->TH, index->FF, middle->MF, ring->RF, pinky->LF"
 )
@@ -104,16 +93,16 @@ def canonicalize_x2_landmarks_for_control_mode(
         canonical = joint_pos.copy()
         source = "operator_fallback"
 
-    left_adapter = control_mode == "left_mode"
+    left_adapter = control_mode == "left_mode" and palm_frame_points is not None
     if left_adapter:
-        canonical *= X2_LEFT_LANDMARK_MIRROR
+        canonical *= X2_LEFT_PALM_FRAME_ADAPTER
     return canonical, {
         "enabled": True,
         "source": source,
         "palm_frame": palm_frame_points is not None,
         "palm_frame_info": palm_frame_info,
         "left_adapter": left_adapter,
-        "mirror": tuple(float(value) for value in X2_LEFT_LANDMARK_MIRROR),
+        "adapter": tuple(float(value) for value in X2_LEFT_PALM_FRAME_ADAPTER),
         "semantic_map": X2_LANDMARK_SEMANTIC_MAP,
     }
 
@@ -121,13 +110,13 @@ def canonicalize_x2_landmarks_for_control_mode(
 def format_x2_landmark_canonicalization(info: dict) -> str:
     if not info.get("enabled"):
         return "off"
-    mirror = info.get("mirror", (1.0, 1.0, 1.0))
+    adapter = info.get("adapter", (1.0, 1.0, 1.0))
     palm_status = "on" if info.get("palm_frame") else "fallback"
     left_status = "on" if info.get("left_adapter") else "off"
     return (
         f"source={info.get('source', 'unknown')}; "
         f"palm_frame={palm_status}; left_adapter={left_status}; "
-        f"mirror xyz=({mirror[0]:+.0f},{mirror[1]:+.0f},{mirror[2]:+.0f}); "
+        f"palm_frame_adapter=({adapter[0]:+.0f},{adapter[1]:+.0f},{adapter[2]:+.0f}); "
         f"semantic {info.get('semantic_map', X2_LANDMARK_SEMANTIC_MAP)}"
     )
 
@@ -136,7 +125,11 @@ def is_x2_four_finger_bend_joint(joint_name: str) -> bool:
     return any(token in joint_name for token in X2_FOUR_FINGER_JOINT_TOKENS)
 
 
-def apply_x2_palm_flex_guard(
+def get_x2_four_finger_command_sign(control_mode: str) -> float:
+    return -1.0 if control_mode == "left_mode" else 1.0
+
+
+def apply_x2_four_finger_control_sign(
     qpos: np.ndarray,
     joint_names: list[str],
     enabled: bool,
@@ -145,15 +138,15 @@ def apply_x2_palm_flex_guard(
     if not enabled:
         return qpos
 
-    guarded = qpos.copy()
+    signed = qpos.copy()
+    sign = get_x2_four_finger_command_sign(control_mode)
     for index, joint_name in enumerate(joint_names):
         if is_x2_four_finger_bend_joint(joint_name):
-            value = float(guarded[index])
-            guarded[index] = max(value, 0.0)
-    return guarded
+            signed[index] = sign * abs(float(signed[index]))
+    return signed
 
 
-def format_x2_palm_flex_guard_changes(
+def format_x2_four_finger_sign_changes(
     before: np.ndarray,
     after: np.ndarray,
     joint_names: list[str],
@@ -166,60 +159,6 @@ def format_x2_palm_flex_guard_changes(
         if abs(float(old_value) - float(new_value)) > threshold:
             changes.append(f"{joint_name}:{float(old_value):+.3f}->{float(new_value):+.3f}")
     return ", ".join(changes) if changes else "none"
-
-
-class JointSignKinematicAdaptor(KinematicAdaptor):
-    def __init__(
-        self,
-        robot,
-        target_joint_names: list[str],
-        joint_names: list[str],
-        joint_signs: np.ndarray,
-        wrapped_adaptor: Optional[KinematicAdaptor] = None,
-    ):
-        super().__init__(robot, target_joint_names)
-        self.wrapped_adaptor = wrapped_adaptor
-        sign_by_name = dict(zip(joint_names, joint_signs))
-        self.pin_signs = np.ones(robot.dof, dtype=np.float32)
-        for index, name in enumerate(robot.dof_joint_names):
-            self.pin_signs[index] = sign_by_name.get(name, 1.0)
-        self.target_signs = self.pin_signs[self.idx_pin2target]
-
-    def forward_qpos(self, qpos: np.ndarray) -> np.ndarray:
-        adapted_qpos = qpos.copy()
-        adapted_qpos *= self.pin_signs
-        if self.wrapped_adaptor is not None:
-            adapted_qpos = self.wrapped_adaptor.forward_qpos(adapted_qpos)
-        return adapted_qpos
-
-    def backward_jacobian(self, jacobian: np.ndarray) -> np.ndarray:
-        if self.wrapped_adaptor is not None:
-            target_jacobian = self.wrapped_adaptor.backward_jacobian(jacobian)
-        else:
-            target_jacobian = jacobian[..., self.idx_pin2target]
-        return target_jacobian * self.target_signs
-
-
-def enable_joint_sign_kinematics(retargeting, joint_signs: np.ndarray) -> None:
-    optimizer = retargeting.optimizer
-    wrapped_adaptor = optimizer.adaptor
-    adaptor = JointSignKinematicAdaptor(
-        optimizer.robot,
-        optimizer.target_joint_names,
-        retargeting.joint_names,
-        joint_signs,
-        wrapped_adaptor=wrapped_adaptor,
-    )
-    optimizer.set_kinematic_adaptor(adaptor)
-
-
-def set_retargeting_optimizer_limits(retargeting, full_joint_limits: np.ndarray) -> None:
-    target_limits = full_joint_limits[retargeting.optimizer.idx_pin2target]
-    retargeting.joint_limits = target_limits.copy()
-    retargeting.optimizer.set_joint_limit(target_limits)
-    retargeting.last_qpos = np.clip(
-        retargeting.last_qpos, target_limits[:, 0], target_limits[:, 1]
-    )
 
 
 def parse_joint_signs(joint_sign: Optional[str], joint_names: list[str]) -> np.ndarray:
@@ -430,16 +369,6 @@ def remap_human_indices(
             18: 6,
             20: 8,
         },
-        "mirror": {
-            6: 18,
-            8: 20,
-            10: 14,
-            12: 16,
-            14: 10,
-            16: 12,
-            18: 6,
-            20: 8,
-        },
         "swap-index-pinky": {
             6: 18,
             8: 20,
@@ -475,40 +404,17 @@ def transform_ref_value(ref_value: np.ndarray, ref_transform: Optional[str]) -> 
         transformed = value[:, [2, 0, 1]].copy()
         return transformed
 
-    def mirror_four_finger_spread(value: np.ndarray) -> np.ndarray:
-        transformed = value.copy()
-        finger_rows = [1, 2, 3, 4, 6, 7, 8, 9]
-        valid_rows = [index for index in finger_rows if index < len(transformed)]
-        transformed[valid_rows, 2] *= -1
-        return transformed
-
     key = ref_transform.lower().replace("-", "_")
     if key == "x2_plain":
         return to_x2_frame(ref_value)
     if key == "x2":
         # MediaPipe vectors after SingleHandDetector are mostly +z along fingers,
-        # while x2's URDF fingers extend along +x. Do not mirror the four fingers;
-        # the x2 URDF link names are mapped to physical fingers in the config.
+        # while x2's URDF fingers extend along +x.
         return to_x2_frame(ref_value)
-    if key == "x2_mirror":
-        return mirror_four_finger_spread(to_x2_frame(ref_value))
-    if key == "x2_flip_z":
-        transformed = to_x2_frame(ref_value)
-        transformed[:, 2] *= -1
-        return transformed
-    if key == "x2_flip_y":
-        transformed = to_x2_frame(ref_value)
-        transformed[:, 1] *= -1
-        return transformed
-    if key == "x2_flip_yz":
-        transformed = to_x2_frame(ref_value)
-        transformed[:, 1] *= -1
-        transformed[:, 2] *= -1
-        return transformed
 
     raise ValueError(
         f"Unknown ref_transform '{ref_transform}'. "
-        "Use none, x2, x2_plain, x2_mirror, x2_flip_y, x2_flip_z, or x2_flip_yz."
+        "Use none, x2, or x2_plain."
     )
 
 
@@ -799,8 +705,7 @@ def start_retargeting(
     robot_name = filepath.stem
     x2_control_mode = get_x2_control_mode(hand_type)
     if ref_transform is None and is_x2_robot(robot_name):
-        # X2 left/right use the same command-frame bending semantics; the
-        # world-space hand direction is mirrored by the robot root pose.
+        # X2 left/right use the same root pose; mode direction is expressed by qpos sign.
         ref_transform = "x2"
     loader.load_multiple_collisions_from_file = True
     if "ability" in robot_name:
@@ -853,39 +758,15 @@ def start_retargeting(
     retargeting_to_sapien = np.array(
         [retargeting_joint_names.index(name) for name in sapien_joint_names]
     ).astype(int)
-    if is_x2_robot(robot_name) and hand_type == "Left" and joint_sign is None:
-        logger.warning(
-            "x2 left_mode is active. "
-            "Using the same single rh_* URDF as right_mode; four-finger commands "
-            "keep the same positive closing semantics as right_mode. "
-            "The world -X closing direction comes from the robot root pose and "
-            "the palm-frame left adapter. "
-            f"Use --joint-sign {X2_LEFT_JOINT_SIGN} only for legacy diagnosis."
-        )
     joint_signs = parse_joint_signs(joint_sign, retargeting_joint_names)
     joint_gains = parse_joint_gains(joint_gain, retargeting_joint_names)
     joint_limits = retargeting.optimizer.robot.joint_limits
     output_joint_limits = get_signed_output_joint_limits(joint_limits, joint_signs)
-    x2_palm_flex_guard_enabled = is_x2_robot(robot_name) and joint_sign is None
-    x2_left_signed_kinematics = False
-    if is_x2_robot(robot_name) and hand_type == "Left" and joint_sign == X2_LEFT_JOINT_SIGN:
-        enable_joint_sign_kinematics(retargeting, joint_signs)
-        set_retargeting_optimizer_limits(retargeting, output_joint_limits)
-        x2_left_signed_kinematics = True
-        logger.warning(
-            "x2 left-hand signed kinematics is active. "
-            "The optimizer now solves in left-hand command qpos while the "
-            "viewer displays the mapped x2 model qpos."
-        )
-    if is_x2_robot(robot_name) and joint_sign is None and hand_type != "Left":
-        logger.warning(
-            "x2 detected. If the fingers bend in the opposite direction, try: "
-            "--joint-sign all=-1"
-        )
+    x2_four_finger_sign_enabled = is_x2_robot(robot_name)
     if joint_sign is not None:
         logger.warning(
-            "--joint-sign is applied after optimization for visual diagnosis. "
-            "If it fixes x2 direction, bake the sign into the URDF joint axis or config."
+            "--joint-sign is an explicit post-retargeting output transform. "
+            "It is not part of the default x2 left/right mode convention."
         )
     if joint_gain is not None:
         logger.warning(
@@ -900,6 +781,17 @@ def start_retargeting(
     if is_x2_robot(robot_name):
         logger.info(f"x2 control mode: {x2_control_mode} (single rh_* URDF)")
         logger.info(
+            "x2 control convention:\n"
+            "  * use_same_root_pose: True\n"
+            "  * use_left_root_mirror: False\n"
+            "  * right_mode_finger_sign: +1\n"
+            "  * left_mode_finger_sign: -1\n"
+            f"  * left_adapter_enabled: {x2_control_mode == 'left_mode'}\n"
+            "  * x2_flip_yz_enabled: False\n"
+            "  * auto_command_sign_flip: False\n"
+            f"  * joint_sign_arg_enabled: {joint_sign is not None}"
+        )
+        logger.info(
             "x2 landmark canonicalization: "
             + format_x2_landmark_canonicalization(
                 {
@@ -907,14 +799,14 @@ def start_retargeting(
                     "source": "palm_frame",
                     "palm_frame": True,
                     "left_adapter": x2_control_mode == "left_mode",
-                    "mirror": tuple(float(value) for value in X2_LEFT_LANDMARK_MIRROR),
+                    "adapter": tuple(float(value) for value in X2_LEFT_PALM_FRAME_ADAPTER),
                     "semantic_map": X2_LANDMARK_SEMANTIC_MAP,
                 }
             )
         )
         logger.info(
-            "x2 palm flex guard: "
-            + ("enabled" if x2_palm_flex_guard_enabled else "disabled")
+            "x2 four-finger mode sign: "
+            f"{get_x2_four_finger_command_sign(x2_control_mode):+.0f}"
         )
     logger.info("Target link mapping:\n" + format_link_human_mapping(retargeting))
     logger.info(
@@ -996,18 +888,18 @@ def start_retargeting(
             ref_value = apply_target_vector_gains(ref_value, target_vector_gains)
             qpos = retargeting.retarget(ref_value)
             unguarded_qpos = qpos.copy()
-            qpos = apply_x2_palm_flex_guard(
+            qpos = apply_x2_four_finger_control_sign(
                 qpos,
                 retargeting_joint_names,
-                x2_palm_flex_guard_enabled,
+                x2_four_finger_sign_enabled,
                 x2_control_mode,
             )
-            if x2_palm_flex_guard_enabled and not np.allclose(qpos, unguarded_qpos):
+            if x2_four_finger_sign_enabled and not np.allclose(qpos, unguarded_qpos):
                 retargeting.set_qpos(qpos)
             signed_qpos = apply_joint_output_transform(
                 qpos, joint_signs, joint_gains, output_joint_limits
             )
-            model_qpos = qpos if x2_left_signed_kinematics else signed_qpos
+            model_qpos = signed_qpos
             if debug_retargeting and frame_id % max(debug_interval, 1) == 0:
                 debug_print_retargeting(
                     frame_id,
@@ -1021,10 +913,10 @@ def start_retargeting(
                     debug_limit_margin,
                     signed_joint_limits=output_joint_limits,
                 )
-                if x2_palm_flex_guard_enabled:
+                if x2_four_finger_sign_enabled:
                     print(
-                        "  x2 palm flex guard:",
-                        format_x2_palm_flex_guard_changes(
+                        "  x2 four-finger mode sign:",
+                        format_x2_four_finger_sign_changes(
                             unguarded_qpos, qpos, retargeting_joint_names
                         ),
                         flush=True,
@@ -1124,11 +1016,10 @@ def main(
         target_vector_gain: pre-optimization target vector gain overrides. Examples:
             "thumb=1.5", "thumb_tip=1.6,thumb_ip=1.2".
         finger_map: remap MediaPipe finger landmarks before retargeting.
-            Use "reverse" to mirror index/middle/ring/pinky, or
+            Use "reverse" to reverse index/middle/ring/pinky, or
             "swap-index-pinky" to swap only index and pinky.
         ref_transform: transform reference vectors into the robot frame.
-            x2 uses axis reorder without mirroring automatically. Use "none" to disable
-            or "x2_mirror" to test the old mirrored spread.
+            x2 uses axis reorder only. Use "none" to disable the transform.
         debug_retargeting: print human vectors and robot qpos in the terminal.
         debug_interval: print one debug block every N detected frames.
         debug_limit_margin: print a joint as near-limit if it is within this many radians.

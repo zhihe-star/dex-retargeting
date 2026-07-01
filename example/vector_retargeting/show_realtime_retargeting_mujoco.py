@@ -49,36 +49,37 @@ from single_hand_detector import SingleHandDetector
 from show_realtime_retargeting import (
     apply_joint_output_transform,
     apply_target_vector_gains,
-    apply_x2_palm_flex_guard,
+    apply_x2_four_finger_control_sign,
     canonicalize_x2_landmarks_for_control_mode,
     debug_print_retargeting,
+    format_x2_four_finger_sign_changes,
     format_x2_landmark_canonicalization,
-    format_x2_palm_flex_guard_changes,
     format_link_human_mapping,
     format_qpos_by_finger,
     format_target_vector_gains,
+    get_x2_four_finger_command_sign,
     get_x2_control_mode,
     get_robot_dir,
     human_landmark_label,
     is_x2_robot,
-    enable_joint_sign_kinematics,
     parse_joint_gains,
     parse_joint_signs,
     parse_target_vector_gains,
     produce_frame,
     remap_human_indices,
-    set_retargeting_optimizer_limits,
     transform_ref_value,
     X2_LANDMARK_SEMANTIC_MAP,
-    X2_LEFT_JOINT_SIGN,
-    X2_LEFT_LANDMARK_MIRROR,
+    X2_LEFT_PALM_FRAME_ADAPTER,
 )
 
 
-X2_RIGHT_ROOT_QUAT = (0.5, -0.5, -0.5, -0.5)
-X2_LEFT_ROOT_QUAT = (0.5, 0.5, -0.5, 0.5)
+X2_ROOT_QUAT = (0.5, -0.5, -0.5, -0.5)
 X2_RIGHT_CAMERA_AZIMUTH = 180.0
-X2_LEFT_CAMERA_AZIMUTH = 0.0
+X2_INTERNAL_QPOS_SMOOTH_ALPHA = 0.65
+X2_INTERNAL_MAX_DELTA = 0.12
+X2_FOUR_FINGER_QPOS_DEADBAND = 0.025
+X2_FOUR_FINGER_DELTA_DEADBAND = 0.01
+X2_LEFT_TARGET_VECTOR_Y_AXIS_GAIN = 0.50
 
 
 def resolve_mujoco_model_path(
@@ -129,10 +130,8 @@ def is_close_tuple(values, expected, atol: float = 1e-9) -> bool:
 
 
 def x2_palm_normal_label(root_quat: tuple[float, float, float, float]) -> str:
-    if is_close_tuple(root_quat, X2_RIGHT_ROOT_QUAT):
+    if is_close_tuple(root_quat, X2_ROOT_QUAT):
         return "world +X"
-    if is_close_tuple(root_quat, X2_LEFT_ROOT_QUAT):
-        return "world -X"
     return "custom"
 
 
@@ -143,6 +142,20 @@ X2_FOUR_FINGER_DISTAL_BODIES = {
     "LF": "rh_lfdistal",
 }
 X2_FINGER_TIP_LOCAL_OFFSET = np.asarray([0.034, 0.0, 0.0], dtype=np.float64)
+X2_THUMB_JOINT_NAMES = ("rh_THJ4", "rh_THJ3", "rh_THJ2", "rh_THJ1")
+X2_JOINT_SWEEP_BODIES = {
+    "rh_FFJ": "rh_ffdistal",
+    "rh_MFJ": "rh_mfdistal",
+    "rh_RFJ": "rh_rfdistal",
+    "rh_LFJ": "rh_lfdistal",
+    "rh_THJ": "rh_thdistal",
+}
+X2_FOUR_FINGER_PRIMARY_SWEEP_JOINTS = {
+    "FF": "rh_FFJ3",
+    "MF": "rh_MFJ3",
+    "RF": "rh_RFJ3",
+    "LF": "rh_LFJ3",
+}
 
 
 def x2_finger_tip_world_position(
@@ -153,6 +166,129 @@ def x2_finger_tip_world_position(
         return None
     rotation = data.xmat[body_id].reshape(3, 3)
     return data.xpos[body_id] + rotation @ X2_FINGER_TIP_LOCAL_OFFSET
+
+
+def compute_x2_joint_sweep_rows(
+    model: mujoco.MjModel,
+    root_joint_name: str,
+    root_pos: tuple[float, float, float],
+    root_quat: tuple[float, float, float, float],
+    joint_names: list[str],
+) -> list[dict]:
+    data = mujoco.MjData(model)
+    root_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, root_joint_name)
+    if root_id < 0:
+        return []
+    root_addr = model.jnt_qposadr[root_id]
+    root_quat_array = np.asarray(root_quat, dtype=np.float64)
+    root_quat_array /= np.linalg.norm(root_quat_array)
+
+    def set_root() -> None:
+        data.qpos[:] = 0.0
+        data.qpos[root_addr : root_addr + 3] = np.asarray(root_pos, dtype=np.float64)
+        data.qpos[root_addr + 3 : root_addr + 7] = root_quat_array
+
+    def tip_position(body_name: str) -> Optional[np.ndarray]:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id < 0:
+            return None
+        rotation = data.xmat[body_id].reshape(3, 3)
+        return data.xpos[body_id] + rotation @ X2_FINGER_TIP_LOCAL_OFFSET
+
+    rows = []
+    for mode in ("right_mode", "left_mode"):
+        set_root()
+        mujoco.mj_forward(model, data)
+        neutral = {
+            body_name: tip_position(body_name)
+            for body_name in set(X2_JOINT_SWEEP_BODIES.values())
+        }
+        for joint_name in joint_names:
+            body_name = next(
+                (
+                    body
+                    for prefix, body in X2_JOINT_SWEEP_BODIES.items()
+                    if prefix in joint_name
+                ),
+                None,
+            )
+            if body_name is None or neutral.get(body_name) is None:
+                continue
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+            )
+            if joint_id < 0:
+                continue
+            qaddr = model.jnt_qposadr[joint_id]
+            for q_value in (0.5, -0.5):
+                set_root()
+                data.qpos[qaddr] = q_value
+                mujoco.mj_forward(model, data)
+                current = tip_position(body_name)
+                if current is None:
+                    continue
+                delta = current - neutral[body_name]
+                rows.append(
+                    {
+                        "mode": mode,
+                        "joint": joint_name,
+                        "q": q_value,
+                        "tip_body": body_name,
+                        "dx": float(delta[0]),
+                        "dy": float(delta[1]),
+                        "dz": float(delta[2]),
+                    }
+                )
+    return rows
+
+
+def format_x2_four_finger_joint_sweep(rows: list[dict]) -> str:
+    if not rows:
+        return "unavailable"
+    parts = []
+    for mode, q_value in (("right_mode", 0.5), ("left_mode", -0.5)):
+        expected = "dx>0" if mode == "right_mode" else "dx<0"
+        finger_parts = []
+        for finger, joint_name in X2_FOUR_FINGER_PRIMARY_SWEEP_JOINTS.items():
+            row = next(
+                (
+                    item
+                    for item in rows
+                    if item["mode"] == mode
+                    and item["joint"] == joint_name
+                    and np.isclose(item["q"], q_value)
+                ),
+                None,
+            )
+            if row is not None:
+                finger_parts.append(f"{finger}:{joint_name} q={q_value:+.1f} dx={row['dx']:+.4f}")
+        parts.append(f"{mode} expected {expected}; " + ", ".join(finger_parts))
+    return " | ".join(parts)
+
+
+def format_x2_thumb_joint_sweep(rows: list[dict]) -> str:
+    if not rows:
+        return "unavailable"
+    parts = []
+    for joint_name in X2_THUMB_JOINT_NAMES:
+        for q_value in (0.5, -0.5):
+            row = next(
+                (
+                    item
+                    for item in rows
+                    if item["mode"] == "right_mode"
+                    and item["joint"] == joint_name
+                    and np.isclose(item["q"], q_value)
+                ),
+                None,
+            )
+            if row is None:
+                continue
+            parts.append(
+                f"{joint_name} q={q_value:+.1f}: "
+                f"thumb_tip d=({row['dx']:+.4f},{row['dy']:+.4f},{row['dz']:+.4f})"
+            )
+    return "; ".join(parts) if parts else "unavailable"
 
 
 def compute_x2_world_finger_tip_dx(
@@ -215,90 +351,6 @@ def format_x2_world_bend_direction(
     )
 
 
-def infer_x2_world_bend_command_signs(
-    model: mujoco.MjModel,
-    root_joint_name: str,
-    root_pos: tuple[float, float, float],
-    root_quat: tuple[float, float, float, float],
-    control_mode: str,
-    joint_names: list[str],
-    probe_qpos: float = 0.5,
-) -> tuple[dict[str, float], dict[str, dict]]:
-    expected_sign = -1.0 if control_mode == "left_mode" else 1.0
-    data = mujoco.MjData(model)
-    signs = {finger: 1.0 for finger in X2_FOUR_FINGER_DISTAL_BODIES}
-    diagnostics = {}
-
-    for finger, distal_body_name in X2_FOUR_FINGER_DISTAL_BODIES.items():
-        token = f"_{finger}J"
-        candidates = [name for name in joint_names if token in name]
-        preferred = [name for name in candidates if name.endswith("J3")]
-        joint_name = (preferred or candidates or [None])[0]
-        if joint_name is None:
-            continue
-
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-        if joint_id < 0:
-            continue
-        qaddr = model.jnt_qposadr[joint_id]
-
-        data.qpos[:] = 0.0
-        set_free_root_pose(model, data, root_joint_name, root_pos, root_quat)
-        mujoco.mj_forward(model, data)
-        neutral_tip = x2_finger_tip_world_position(model, data, distal_body_name)
-        if neutral_tip is None:
-            continue
-
-        data.qpos[qaddr] = probe_qpos
-        mujoco.mj_forward(model, data)
-        probe_tip = x2_finger_tip_world_position(model, data, distal_body_name)
-        if probe_tip is None:
-            continue
-
-        dx = float(probe_tip[0] - neutral_tip[0])
-        signs[finger] = 1.0 if expected_sign * dx > 1e-6 else -1.0
-        diagnostics[finger] = {
-            "joint": joint_name,
-            "probe_qpos": probe_qpos,
-            "dx": dx,
-            "command_sign": signs[finger],
-        }
-    return signs, diagnostics
-
-
-def apply_x2_world_bend_command_signs(
-    qpos: np.ndarray,
-    joint_names: list[str],
-    command_signs: dict[str, float],
-    enabled: bool,
-) -> np.ndarray:
-    if not enabled:
-        return qpos
-
-    output = qpos.copy()
-    for index, joint_name in enumerate(joint_names):
-        for finger, sign in command_signs.items():
-            if f"_{finger}J" in joint_name:
-                output[index] *= sign
-                break
-    return output
-
-
-def format_x2_world_bend_command_signs(
-    diagnostics: dict[str, dict],
-    control_mode: str,
-) -> str:
-    if not diagnostics:
-        return "unavailable"
-    expected = "dx<0" if control_mode == "left_mode" else "dx>0"
-    return "; ".join(
-        f"{finger}:{values.get('joint')} +{values.get('probe_qpos', 0.0):.2f}"
-        f" -> dx={values.get('dx', 0.0):+.4f},"
-        f"cmd_sign={values.get('command_sign', 1.0):+.0f}"
-        for finger, values in diagnostics.items()
-    ) + f" (expected {expected})"
-
-
 def build_qpos_addr_map(model: mujoco.MjModel, joint_names: list[str]) -> np.ndarray:
     qpos_addrs = []
     missing = []
@@ -351,42 +403,91 @@ def get_signed_output_joint_limits(
     return output_limits
 
 
+def build_x2_four_finger_deadband_mask(joint_names: list[str]) -> np.ndarray:
+    tokens = ("rh_FFJ", "rh_MFJ", "rh_RFJ", "rh_LFJ")
+    return np.asarray(
+        [any(token in joint_name for token in tokens) for joint_name in joint_names],
+        dtype=bool,
+    )
+
+
 class X2CommandSmoother:
-    def __init__(self, alpha: float = 0.65, max_delta: float = 0.18) -> None:
+    def __init__(
+        self,
+        alpha: float = X2_INTERNAL_QPOS_SMOOTH_ALPHA,
+        max_delta: float = X2_INTERNAL_MAX_DELTA,
+        deadband_mask: Optional[np.ndarray] = None,
+        qpos_deadband: float = X2_FOUR_FINGER_QPOS_DEADBAND,
+        delta_deadband: float = X2_FOUR_FINGER_DELTA_DEADBAND,
+    ) -> None:
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self.max_delta = float(max_delta)
+        self.deadband_mask = (
+            np.asarray(deadband_mask, dtype=bool)
+            if deadband_mask is not None
+            else None
+        )
+        self.qpos_deadband = float(max(0.0, qpos_deadband))
+        self.delta_deadband = float(max(0.0, delta_deadband))
         self.previous: Optional[np.ndarray] = None
 
     def reset(self) -> None:
         self.previous = None
 
     def update(self, qpos: np.ndarray) -> tuple[np.ndarray, dict]:
+        filtered = qpos.copy()
+        deadband_mask = None
+        if self.deadband_mask is not None and len(self.deadband_mask) == len(filtered):
+            deadband_mask = self.deadband_mask
+            zero_mask = deadband_mask & (np.abs(filtered) < self.qpos_deadband)
+            filtered[zero_mask] = 0.0
+
         if self.previous is None:
-            self.previous = qpos.copy()
-            return qpos, {
+            self.previous = filtered.copy()
+            return filtered, {
                 "enabled": True,
                 "initialized": True,
                 "alpha": self.alpha,
                 "max_delta": self.max_delta,
+                "qpos_deadband": self.qpos_deadband,
+                "delta_deadband": self.delta_deadband,
                 "dq_max_abs": 0.0,
                 "clipped": False,
+                "deadband_joints": int(np.sum(deadband_mask)) if deadband_mask is not None else 0,
             }
 
-        blended = self.alpha * qpos + (1.0 - self.alpha) * self.previous
+        if deadband_mask is not None and self.delta_deadband > 0:
+            hold_mask = deadband_mask & (
+                np.abs(filtered - self.previous) < self.delta_deadband
+            )
+            filtered[hold_mask] = self.previous[hold_mask]
+
+        blended = self.alpha * filtered + (1.0 - self.alpha) * self.previous
         delta = blended - self.previous
         if self.max_delta > 0:
             clipped_delta = np.clip(delta, -self.max_delta, self.max_delta)
         else:
             clipped_delta = delta
         smoothed = self.previous + clipped_delta
+        if deadband_mask is not None:
+            final_zero_mask = (
+                deadband_mask
+                & (np.abs(filtered) < self.qpos_deadband)
+                & (np.abs(smoothed) < self.qpos_deadband)
+            )
+            smoothed[final_zero_mask] = 0.0
+            clipped_delta = smoothed - self.previous
         self.previous = smoothed.copy()
         return smoothed, {
             "enabled": True,
             "initialized": False,
             "alpha": self.alpha,
             "max_delta": self.max_delta,
+            "qpos_deadband": self.qpos_deadband,
+            "delta_deadband": self.delta_deadband,
             "dq_max_abs": float(np.max(np.abs(clipped_delta))) if len(clipped_delta) else 0.0,
             "clipped": bool(not np.allclose(delta, clipped_delta)),
+            "deadband_joints": int(np.sum(deadband_mask)) if deadband_mask is not None else 0,
         }
 
 
@@ -396,6 +497,8 @@ def format_x2_command_smoothing(info: dict) -> str:
     return (
         f"alpha={info.get('alpha', 0.0):.2f},"
         f"max_delta={info.get('max_delta', 0.0):.3f},"
+        f"deadband={info.get('qpos_deadband', 0.0):.3f}/"
+        f"{info.get('delta_deadband', 0.0):.3f},"
         f"dq_max={info.get('dq_max_abs', 0.0):.3f},"
         f"clipped={info.get('clipped', False)}"
     )
@@ -641,77 +744,20 @@ class X2DebugRecorder:
         model: mujoco.MjModel,
         root_joint_name: str,
         root_pos: tuple[float, float, float],
+        root_quat: tuple[float, float, float, float],
+        rows: Optional[list[dict]] = None,
     ) -> None:
         if not self.enabled:
             return
         path = self.debug_dir / "joint_sweep.csv"
-        data = mujoco.MjData(model)
-        root_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, root_joint_name)
-        if root_id < 0:
-            return
-        root_addr = model.jnt_qposadr[root_id]
-        joint_to_body = {
-            "rh_FFJ": "rh_ffdistal",
-            "rh_MFJ": "rh_mfdistal",
-            "rh_RFJ": "rh_rfdistal",
-            "rh_LFJ": "rh_lfdistal",
-            "rh_THJ": "rh_thdistal",
-        }
-
-        def set_root(quat):
-            data.qpos[:] = 0.0
-            data.qpos[root_addr : root_addr + 3] = np.asarray(root_pos, dtype=np.float64)
-            data.qpos[root_addr + 3 : root_addr + 7] = quat
-
-        def tip_position(body_name: str) -> Optional[np.ndarray]:
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            if body_id < 0:
-                return None
-            rotation = data.xmat[body_id].reshape(3, 3)
-            return data.xpos[body_id] + rotation @ X2_FINGER_TIP_LOCAL_OFFSET
-
-        rows = []
-        for mode, quat in [
-            ("right_mode", X2_RIGHT_ROOT_QUAT),
-            ("left_mode", X2_LEFT_ROOT_QUAT),
-        ]:
-            set_root(quat)
-            mujoco.mj_forward(model, data)
-            neutral = {}
-            for body_name in set(joint_to_body.values()):
-                neutral[body_name] = tip_position(body_name)
-            for joint_name in self.joint_names:
-                body_name = next(
-                    (body for prefix, body in joint_to_body.items() if prefix in joint_name),
-                    None,
-                )
-                if body_name is None or neutral.get(body_name) is None:
-                    continue
-                joint_id = mujoco.mj_name2id(
-                    model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
-                )
-                if joint_id < 0:
-                    continue
-                qaddr = model.jnt_qposadr[joint_id]
-                for q_value in (0.5, -0.5):
-                    set_root(quat)
-                    data.qpos[qaddr] = q_value
-                    mujoco.mj_forward(model, data)
-                    current = tip_position(body_name)
-                    if current is None:
-                        continue
-                    delta = current - neutral[body_name]
-                    rows.append(
-                        {
-                            "mode": mode,
-                            "joint": joint_name,
-                            "q": q_value,
-                            "tip_body": body_name,
-                            "dx": float(delta[0]),
-                            "dy": float(delta[1]),
-                            "dz": float(delta[2]),
-                        }
-                    )
+        if rows is None:
+            rows = compute_x2_joint_sweep_rows(
+                model,
+                root_joint_name,
+                root_pos,
+                root_quat,
+                self.joint_names,
+            )
         with path.open("w", newline="") as handle:
             writer = csv.DictWriter(
                 handle, fieldnames=["mode", "joint", "q", "tip_body", "dx", "dy", "dz"]
@@ -828,11 +874,6 @@ def launch_mujoco_viewer(
 
 
 X2_NATURAL_VECTOR_GAIN = (
-    "rh_thbase-rh_palm=0.18,"
-    "rh_thproximal-rh_palm=0.45,"
-    "rh_thproximal-rh_thbase=0.70,"
-    "rh_thmiddle-rh_thproximal=1.05,"
-    "rh_thtip-rh_thmiddle=1.10,"
     "rh_thtip-rh_fftip=0.35,"
     "rh_thtip-rh_mftip=0.25,"
     "rh_lfmiddle-rh_lfproximal=0.75,"
@@ -854,28 +895,15 @@ X2_NATURAL_VECTOR_GAIN = (
 )
 
 X2_NATURAL_AXIS_GAIN = (
-    "rh_thbase-rh_palm:x=0.18,"
-    "rh_thbase-rh_palm:y=0.18,"
-    "rh_thbase-rh_palm:z=0.18,"
-    "rh_thproximal-rh_thbase:x=0.60,"
-    "rh_thproximal-rh_thbase:y=0.95,"
-    "rh_thproximal-rh_thbase:z=0.90,"
-    "rh_thmiddle-rh_thproximal:x=0.80,"
-    "rh_thmiddle-rh_thproximal:y=1.00,"
-    "rh_thmiddle-rh_thproximal:z=0.95,"
-    "rh_thtip-rh_thmiddle:x=0.80,"
-    "rh_thtip-rh_thmiddle:y=1.00,"
-    "rh_thtip-rh_thmiddle:z=0.95,"
-    "rh_thtip-rh_palm:y=0.70,"
-    "rh_thmiddle-rh_palm:y=0.70,"
-    "rh_fftip-rh_palm:y=0.50,"
-    "rh_ffmiddle-rh_palm:y=0.45,"
-    "rh_mftip-rh_palm:y=0.48,"
-    "rh_mfmiddle-rh_palm:y=0.43,"
-    "rh_rftip-rh_palm:y=0.45,"
-    "rh_rfmiddle-rh_palm:y=0.40,"
-    "rh_lftip-rh_palm:y=0.42,"
-    "rh_lfmiddle-rh_palm:y=0.38,"
+    "rh_thtip-rh_palm:y=0.55,"
+    "rh_fftip-rh_palm:y=0.32,"
+    "rh_ffmiddle-rh_palm:y=0.28,"
+    "rh_mftip-rh_palm:y=0.31,"
+    "rh_mfmiddle-rh_palm:y=0.27,"
+    "rh_rftip-rh_palm:y=0.30,"
+    "rh_rfmiddle-rh_palm:y=0.26,"
+    "rh_lftip-rh_palm:y=0.28,"
+    "rh_lfmiddle-rh_palm:y=0.24,"
     "rh_fftip-rh_palm:z=0.88,"
     "rh_ffmiddle-rh_palm:z=0.84,"
     "rh_mftip-rh_palm:z=0.88,"
@@ -892,58 +920,67 @@ X2_NATURAL_JOINT_LIMITS = [
     "rh_RFJ3=-1.20:1.20",
     "rh_LFJ3=-1.20:1.20",
     "rh_THJ4=-1.74:1.65",
-    "rh_THJ3=-0.95:0.12",
-    "rh_THJ2=-1.31:0.00",
-    "rh_THJ1=-1.31:0.00",
+    "rh_THJ3=-1.31:1.31",
+    "rh_THJ2=-1.31:1.31",
+    "rh_THJ1=-1.31:1.31",
 ]
 
-X2_RIGHT_THUMB_PINCH_TARGET_QPOS = {
-    "rh_THJ4": np.deg2rad(66.0),
-    "rh_THJ3": np.deg2rad(-8.0),
-    "rh_THJ2": np.deg2rad(-42.0),
-    "rh_THJ1": np.deg2rad(-26.0),
-}
-X2_LEFT_THUMB_PINCH_TARGET_QPOS = {
-    "rh_THJ4": np.deg2rad(-66.0),
-    "rh_THJ3": np.deg2rad(-8.0),
-    "rh_THJ2": np.deg2rad(-42.0),
-    "rh_THJ1": np.deg2rad(-26.0),
-}
 X2_PINCH_ACTIVATION_NEAR = 0.055
 X2_PINCH_ACTIVATION_FAR = 0.12
 X2_FINGER_STRAIGHT_CLOSED_RATIO = 1.08
 X2_FINGER_STRAIGHT_OPEN_RATIO = 1.22
-X2_THUMB_STRAIGHT_CLOSED_RATIO = 1.25
-X2_THUMB_STRAIGHT_OPEN_RATIO = 1.60
-X2_THUMB_DIRECT_JOINTS = ("rh_THJ3", "rh_THJ2", "rh_THJ1")
+X2_THUMB_DIRECT_JOINTS = ("rh_THJ4", "rh_THJ3", "rh_THJ2", "rh_THJ1")
 X2_THUMB_DIRECT_BASELINE_FRAMES = 12
-X2_THUMB_DIRECT_DEADZONE_DEG = {
-    "rh_THJ3": 1.0,
-    "rh_THJ2": 2.0,
-    "rh_THJ1": 1.5,
+X2_THUMB_DIRECT_DEADZONE = {
+    "rh_THJ4": 0.0,
+    "rh_THJ3": 0.35,
+    "rh_THJ2": 1.2,
+    "rh_THJ1": 1.0,
 }
-X2_THUMB_DIRECT_GAIN_RAD_PER_DEG = {
-    "rh_THJ3": np.deg2rad(0.85),
-    "rh_THJ2": np.deg2rad(0.70),
-    "rh_THJ1": np.deg2rad(0.75),
+X2_THUMB_DIRECT_GAIN = {
+    "rh_THJ4": 1.0,
+    "rh_THJ3": np.deg2rad(0.65),
+    "rh_THJ2": np.deg2rad(1.15),
+    "rh_THJ1": np.deg2rad(1.05),
 }
 X2_THUMB_DIRECT_BLEND = {
+    "rh_THJ4": 1.0,
     "rh_THJ3": 1.0,
     "rh_THJ2": 1.0,
     "rh_THJ1": 1.0,
 }
+X2_THUMB_CONTROL_EMA_ALPHA = 0.65
+X2_THUMB_FEATURE_EMA_ALPHA = 0.60
+X2_THUMB_DIRECT_MIN_AMOUNT = {
+    "rh_THJ4": 0.045,
+    "rh_THJ3": 0.25,
+    "rh_THJ2": 0.35,
+    "rh_THJ1": 0.35,
+}
+X2_THUMB_DIRECT_MAX_MAGNITUDE = {
+    "rh_THJ4": 1.10,
+    "rh_THJ3": 0.25,
+    "rh_THJ2": 0.60,
+    "rh_THJ1": 0.45,
+}
+X2_THUMB_COORDINATION_PROGRESS_START = 0.45
+X2_THUMB_COORDINATION_PROGRESS_END = 0.85
+X2_THUMB_COORDINATION_EXTRA = {
+    "rh_THJ3": 0.10,
+    "rh_THJ2": 0.16,
+    "rh_THJ1": 0.08,
+}
+X2_THJ4_SOFT_MAX_LOW_FLEXION = 0.90
+X2_THJ4_SOFT_FLEXION_LOW_DEG = 10.0
+X2_THJ4_SOFT_FLEXION_HIGH_DEG = 18.0
+X2_THJ4_SOFT_PROGRESS_START = 0.60
+X2_THJ4_SOFT_PROGRESS_END = 0.95
 X2_THUMB_ROOT_PALM_PROJECTION_SCALE = 0.45
 X2_FINGER_LANDMARKS = {
     "index": (6, 8),
     "middle": (10, 12),
     "ring": (14, 16),
     "pinky": (18, 20),
-}
-X2_FINGER_JOINT_TOKENS = {
-    "index": "_FF",
-    "middle": "_MF",
-    "ring": "_RF",
-    "pinky": "_LF",
 }
 X2_FINGER_DIRECT_LANDMARKS = {
     "index": (0, 5, 6, 7, 8),
@@ -963,14 +1000,42 @@ X2_FINGER_DIRECT_DEADZONE_DEG = {
     "pip": 4.0,
     "dip": 4.0,
 }
-X2_FINGER_DIRECT_GAIN_RAD_PER_DEG = {
-    "mcp": np.deg2rad(0.95),
-    "pip": np.deg2rad(1.10),
-    "dip": np.deg2rad(1.00),
+X2_FINGER_CURL_INPUT_WEIGHT = {
+    "mcp": 0.65,
+    "pip": 0.85,
+    "dip": 0.55,
 }
-X2_FINGER_DIRECT_SMOOTHING = 0.65
+X2_FINGER_CURL_STAGE_POINTS = (
+    (0.35, {"mcp": 0.72, "pip": 0.24, "dip": 0.06}),
+    (1.05, {"mcp": 0.52, "pip": 0.72, "dip": 0.34}),
+    (1.65, {"mcp": 0.58, "pip": 0.66, "dip": 0.52}),
+)
+X2_FINGER_CURL_GAIN_RAD_PER_DEG = np.deg2rad(1.05)
+X2_FINGER_NEAR_LIMIT_MARGIN = 0.12
+X2_FINGER_DIRECT_QPOS_HYSTERESIS = 0.012
+X2_FINGER_ANGLE_EMA_ALPHA = 0.60
 X2_FINGER_COUPLING_PIP_PER_MCP = 0.8
 X2_FINGER_COUPLING_DIP_PER_PIP = 0.5
+X2_FINGER_MODE_GAIN = {
+    "right_mode": {"mcp": 1.00, "pip": 1.05, "dip": 1.10},
+    "left_mode": {"mcp": 1.10, "pip": 1.30, "dip": 1.35},
+}
+X2_THUMB_DIRECT_MIN_RELATIVE_IMPROVEMENT = 0.15
+X2_THUMB_DIRECT_MIN_ABSOLUTE_IMPROVEMENT = 0.02
+X2_THJ4_SIDE_DEADZONE = 0.010
+X2_THJ4_PALM_DEADZONE = 0.010
+X2_THJ4_OPPOSITION_GATE = 0.040
+X2_THJ4_SIDE_HIGH = 0.120
+X2_THJ4_PALM_HIGH = 0.120
+X2_THJ4_BASE_SIDE_WEIGHT = 0.70
+X2_THJ4_TIP_SIDE_WEIGHT = 0.30
+X2_THJ4_PALM_WEIGHT = 0.55
+X2_THJ4_PINCH_AUX_WEIGHT = 0.04
+X2_THJ4_EARLY_PROGRESS = 0.300
+X2_THJ4_EARLY_AMOUNT = 0.450
+X2_THJ4_AMOUNT_BASE_WEIGHT = 0.80
+X2_THJ4_AMOUNT_PALM_WEIGHT = 0.15
+X2_THJ4_AMOUNT_TIP_WEIGHT = 0.05
 
 
 def parse_x2_finger_direct_gain(gain_spec: Optional[str]) -> dict[str, float]:
@@ -1017,13 +1082,19 @@ def format_x2_finger_direct_gain(gains: dict[str, float]) -> str:
     return ", ".join(f"{key}={value:.2f}" for key, value in gains.items())
 
 
+def get_x2_finger_mode_gain(control_mode: str) -> dict[str, float]:
+    return X2_FINGER_MODE_GAIN.get(
+        control_mode,
+        {"mcp": 1.0, "pip": 1.0, "dip": 1.0},
+    ).copy()
+
+
 X2_PALM_VECTOR_MIN_X = {
     "rh_thtip-rh_palm": 0.082,
     "rh_fftip-rh_palm": 0.092,
     "rh_mftip-rh_palm": 0.096,
     "rh_rftip-rh_palm": 0.092,
     "rh_lftip-rh_palm": 0.086,
-    "rh_thmiddle-rh_palm": 0.075,
     "rh_ffmiddle-rh_palm": 0.105,
     "rh_mfmiddle-rh_palm": 0.108,
     "rh_rfmiddle-rh_palm": 0.105,
@@ -1036,7 +1107,6 @@ X2_PALM_VECTOR_MAX_X = {
     "rh_mftip-rh_palm": 0.142,
     "rh_rftip-rh_palm": 0.140,
     "rh_lftip-rh_palm": 0.135,
-    "rh_thmiddle-rh_palm": 0.095,
     "rh_ffmiddle-rh_palm": 0.120,
     "rh_mfmiddle-rh_palm": 0.122,
     "rh_rfmiddle-rh_palm": 0.120,
@@ -1045,7 +1115,6 @@ X2_PALM_VECTOR_MAX_X = {
 
 X2_PALM_VECTOR_MAX_Z = {
     "rh_thtip-rh_palm": 0.045,
-    "rh_thmiddle-rh_palm": 0.040,
 }
 
 
@@ -1072,11 +1141,6 @@ def add_x2_local_shape_constraints(config: RetargetingConfig) -> list[str]:
         return []
 
     local_specs = [
-        ("rh_palm", "rh_thbase", 0, 1),
-        ("rh_thbase", "rh_thproximal", 1, 2),
-        ("rh_thproximal", "rh_thmiddle", 2, 3),
-        ("rh_thmiddle", "rh_thtip", 3, 4),
-        ("rh_palm", "rh_thproximal", 0, 2),
         ("rh_fftip", "rh_thtip", 8, 4),
         ("rh_mftip", "rh_thtip", 12, 4),
         ("rh_ffproximal", "rh_ffmiddle", 5, 6),
@@ -1124,6 +1188,46 @@ def add_x2_local_shape_constraints(config: RetargetingConfig) -> list[str]:
     return added
 
 
+def remove_x2_thumb_hard_match_objectives(config: RetargetingConfig) -> list[str]:
+    if config.type != "vector":
+        return []
+    if config.target_origin_link_names is None or config.target_task_link_names is None:
+        return []
+    if config.target_link_human_indices is None:
+        return []
+
+    removed_pairs = {
+        ("rh_palm", "rh_thbase"),
+        ("rh_thbase", "rh_thproximal"),
+        ("rh_thproximal", "rh_thmiddle"),
+        ("rh_thmiddle", "rh_thtip"),
+        ("rh_palm", "rh_thproximal"),
+        ("rh_palm", "rh_thmiddle"),
+    }
+    removed = []
+    keep = []
+    for origin_link, task_link in zip(
+        config.target_origin_link_names, config.target_task_link_names
+    ):
+        should_remove = (origin_link, task_link) in removed_pairs
+        keep.append(not should_remove)
+        if should_remove:
+            removed.append(f"{task_link}-{origin_link}")
+
+    if not removed:
+        return []
+
+    indices = np.asarray(config.target_link_human_indices)
+    config.target_origin_link_names = [
+        name for name, should_keep in zip(config.target_origin_link_names, keep) if should_keep
+    ]
+    config.target_task_link_names = [
+        name for name, should_keep in zip(config.target_task_link_names, keep) if should_keep
+    ]
+    config.target_link_human_indices = indices[:, keep]
+    return removed
+
+
 def apply_x2_natural_ref_shape(
     ref_value: np.ndarray,
     retargeting,
@@ -1150,19 +1254,6 @@ def apply_x2_natural_ref_shape(
         if max_z is not None and shaped[i, 2] > 0:
             shaped[i, 2] = min(shaped[i, 2], max_z)
     return shaped
-
-
-def get_x2_thumb_pinch_target_qpos(hand_type: str) -> dict[str, float]:
-    if hand_type == "Left":
-        return X2_LEFT_THUMB_PINCH_TARGET_QPOS
-    return X2_RIGHT_THUMB_PINCH_TARGET_QPOS
-
-
-def format_x2_thumb_pinch_target_qpos(target_qpos: dict[str, float]) -> str:
-    return ", ".join(
-        f"{joint_name}={np.rad2deg(value):+.1f}deg"
-        for joint_name, value in target_qpos.items()
-    )
 
 
 def ratio_to_unit_interval(value: float, lower: float, upper: float) -> float:
@@ -1194,22 +1285,6 @@ def compute_x2_finger_straightness(joint_pos: Optional[np.ndarray]) -> dict[str,
     return info
 
 
-def compute_x2_thumb_straightness(joint_pos: Optional[np.ndarray]) -> dict:
-    if joint_pos is None or len(joint_pos) <= 4:
-        return {}
-
-    wrist = joint_pos[0]
-    ip_norm = float(np.linalg.norm(joint_pos[3] - wrist))
-    tip_norm = float(np.linalg.norm(joint_pos[4] - wrist))
-    ratio = tip_norm / max(ip_norm, 1e-6)
-    straightness = ratio_to_unit_interval(
-        ratio,
-        X2_THUMB_STRAIGHT_CLOSED_RATIO,
-        X2_THUMB_STRAIGHT_OPEN_RATIO,
-    )
-    return {"ratio": ratio, "straightness": straightness}
-
-
 def compute_x2_pinch_gate_info(
     joint_pos: Optional[np.ndarray], pinch_finger: str
 ) -> dict[str, dict]:
@@ -1230,63 +1305,6 @@ def format_x2_pinch_gate_info(gate_info: dict[str, dict]) -> str:
     )
 
 
-def apply_x2_open_hand_relaxation(
-    qpos: np.ndarray,
-    joint_names: list[str],
-    profile: Optional[str],
-    joint_pos: Optional[np.ndarray],
-    pinch_strength: float,
-) -> tuple[np.ndarray, dict]:
-    if not is_x2_profile_enabled(profile) or joint_pos is None:
-        return qpos, {"enabled": False}
-
-    output = qpos.copy()
-    finger_info = compute_x2_finger_straightness(joint_pos)
-    for finger, values in finger_info.items():
-        token = X2_FINGER_JOINT_TOKENS[finger]
-        straightness = float(values["straightness"])
-        if straightness <= 0:
-            continue
-        scale = 1.0 - straightness
-        for index, joint_name in enumerate(joint_names):
-            if token in joint_name:
-                output[index] *= scale
-
-    thumb_info = compute_x2_thumb_straightness(joint_pos)
-    thumb_straightness = float(thumb_info.get("straightness", 0.0))
-    thumb_relax = thumb_straightness * (1.0 - float(np.clip(pinch_strength, 0.0, 1.0)))
-    if thumb_relax > 0:
-        scale = 1.0 - thumb_relax
-        for index, joint_name in enumerate(joint_names):
-            if "_TH" in joint_name:
-                output[index] *= scale
-
-    return output, {
-        "enabled": True,
-        "finger": finger_info,
-        "thumb": thumb_info,
-        "thumb_relax": thumb_relax,
-    }
-
-
-def format_x2_open_hand_relaxation(info: dict) -> str:
-    if not info.get("enabled"):
-        return "off"
-    finger_parts = []
-    for finger, values in info.get("finger", {}).items():
-        finger_parts.append(
-            f"{finger}:straight={values.get('straightness', 0.0):.2f},"
-            f"ratio={values.get('ratio', 0.0):.2f}"
-        )
-    thumb = info.get("thumb", {})
-    thumb_text = (
-        f"thumb:straight={thumb.get('straightness', 0.0):.2f},"
-        f"ratio={thumb.get('ratio', 0.0):.2f},"
-        f"relax={info.get('thumb_relax', 0.0):.2f}"
-    )
-    return "; ".join(finger_parts + [thumb_text])
-
-
 def compute_x2_finger_raw_angles(joint_pos: np.ndarray) -> dict[str, dict[str, float]]:
     angles = {}
     for finger, (wrist, mcp, pip, dip, tip) in X2_FINGER_DIRECT_LANDMARKS.items():
@@ -1298,14 +1316,111 @@ def compute_x2_finger_raw_angles(joint_pos: np.ndarray) -> dict[str, dict[str, f
     return angles
 
 
+def x2_signed_joint_limit_magnitude(
+    joint_limits: np.ndarray,
+    joint_index: int,
+    sign: float,
+) -> float:
+    lower, upper = joint_limits[joint_index]
+    if sign >= 0:
+        return max(0.0, float(upper))
+    return max(0.0, float(-lower))
+
+
+def interpolate_x2_finger_curl_distribution(curl: float) -> dict[str, float]:
+    if curl <= 0.0:
+        return {"mcp": 0.0, "pip": 0.0, "dip": 0.0}
+
+    previous_limit, previous_distribution = X2_FINGER_CURL_STAGE_POINTS[0]
+    if curl <= previous_limit:
+        return previous_distribution.copy()
+
+    for limit, distribution in X2_FINGER_CURL_STAGE_POINTS[1:]:
+        if curl <= limit:
+            ratio = (curl - previous_limit) / max(limit - previous_limit, 1e-6)
+            return {
+                key: (1.0 - ratio) * previous_distribution[key]
+                + ratio * distribution[key]
+                for key in ("mcp", "pip", "dip")
+            }
+        previous_limit = limit
+        previous_distribution = distribution
+    return previous_distribution.copy()
+
+
+def add_x2_curl_excess_with_capacity(
+    values: dict[str, float],
+    caps: dict[str, float],
+    excess: float,
+    preferred_keys: tuple[str, ...],
+) -> float:
+    remaining = float(max(0.0, excess))
+    for _ in range(2):
+        available = [
+            key for key in preferred_keys if caps.get(key, 0.0) - values.get(key, 0.0) > 1e-6
+        ]
+        if remaining <= 1e-6 or not available:
+            break
+        total_capacity = sum(caps[key] - values[key] for key in available)
+        if total_capacity <= 1e-6:
+            break
+        used = 0.0
+        for key in available:
+            capacity = caps[key] - values[key]
+            portion = remaining * capacity / total_capacity
+            addition = min(capacity, portion)
+            values[key] += addition
+            used += addition
+        remaining -= used
+    return remaining
+
+
+def redistribute_x2_finger_curl_near_limits(
+    magnitudes: dict[str, float],
+    joint_indices: dict[str, int],
+    joint_limits: np.ndarray,
+    sign: float,
+) -> dict[str, float]:
+    redistributed = magnitudes.copy()
+    caps = {}
+    for joint_key, joint_index in joint_indices.items():
+        limit = x2_signed_joint_limit_magnitude(joint_limits, joint_index, sign)
+        caps[joint_key] = max(0.0, limit - X2_FINGER_NEAR_LIMIT_MARGIN)
+
+    if not caps:
+        return redistributed
+
+    pip_cap = caps.get("pip")
+    if pip_cap is not None and redistributed["pip"] > pip_cap:
+        excess = redistributed["pip"] - pip_cap
+        redistributed["pip"] = pip_cap
+        add_x2_curl_excess_with_capacity(
+            redistributed, caps, excess, ("mcp", "dip")
+        )
+
+    for joint_key in ("mcp", "dip", "pip"):
+        cap = caps.get(joint_key)
+        if cap is None or redistributed[joint_key] <= cap:
+            continue
+        excess = redistributed[joint_key] - cap
+        redistributed[joint_key] = cap
+        preferred = tuple(key for key in ("mcp", "pip", "dip") if key != joint_key)
+        add_x2_curl_excess_with_capacity(redistributed, caps, excess, preferred)
+
+    for joint_key, cap in caps.items():
+        redistributed[joint_key] = min(redistributed[joint_key], cap)
+    return redistributed
+
+
 class X2FingerDirectMappingState:
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
         self.baseline: Optional[dict[str, dict[str, float]]] = None
+        self.filtered_angles: Optional[dict[str, dict[str, float]]] = None
+        self.previous_direct_qpos: dict[str, float] = {}
         self.samples = 0
-        self.smoothed_qpos: Optional[dict[str, float]] = None
 
     def update(
         self,
@@ -1318,41 +1433,59 @@ class X2FingerDirectMappingState:
     ) -> dict:
         if (
             not is_x2_profile_enabled(profile)
-            or control_mode != "left_mode"
             or joint_pos is None
             or len(joint_pos) <= 20
         ):
             return {"enabled": False}
 
         raw_angles = compute_x2_finger_raw_angles(joint_pos)
+        if self.filtered_angles is None:
+            self.filtered_angles = {
+                finger: values.copy() for finger, values in raw_angles.items()
+            }
+        else:
+            alpha = X2_FINGER_ANGLE_EMA_ALPHA
+            for finger, values in raw_angles.items():
+                for joint_key, value in values.items():
+                    previous = self.filtered_angles[finger][joint_key]
+                    self.filtered_angles[finger][joint_key] = (
+                        alpha * value + (1.0 - alpha) * previous
+                    )
+        angles = {
+            finger: values.copy() for finger, values in self.filtered_angles.items()
+        }
         if self.baseline is None:
             self.baseline = {
-                finger: values.copy() for finger, values in raw_angles.items()
+                finger: values.copy() for finger, values in angles.items()
             }
             self.samples = 1
         elif self.samples < X2_FINGER_DIRECT_BASELINE_FRAMES:
-            for finger, values in raw_angles.items():
+            for finger, values in angles.items():
                 for joint_key, value in values.items():
                     self.baseline[finger][joint_key] = min(
                         self.baseline[finger][joint_key], value
                     )
             self.samples += 1
-        else:
-            for finger, values in raw_angles.items():
-                for joint_key, value in values.items():
-                    if value < self.baseline[finger][joint_key]:
-                        self.baseline[finger][joint_key] = (
-                            0.90 * self.baseline[finger][joint_key] + 0.10 * value
-                        )
 
         calibrated = self.samples >= X2_FINGER_DIRECT_BASELINE_FRAMES
         direct_qpos = {}
         flexion_deg = {}
+        curl_rad = {}
+        curl_rad_after_mode_gain = {}
+        redistribution = {}
+        finger_qpos_before_mode_gain = {}
+        finger_qpos_after_mode_gain = {}
         clipped = {}
-        sign = 1.0
-        for finger, values in raw_angles.items():
+        sign = get_x2_four_finger_command_sign(control_mode)
+        mode_gain = get_x2_finger_mode_gain(control_mode)
+        for finger, values in angles.items():
             flexion_deg[finger] = {}
             mcp_joint, pip_joint, dip_joint = X2_FINGER_DIRECT_JOINTS[finger]
+            joint_lookup = {
+                "mcp": mcp_joint,
+                "pip": pip_joint,
+                "dip": dip_joint,
+            }
             for joint_key, joint_name in [
                 ("mcp", mcp_joint),
                 ("pip", pip_joint),
@@ -1362,41 +1495,95 @@ class X2FingerDirectMappingState:
                 deadzone = X2_FINGER_DIRECT_DEADZONE_DEG[joint_key]
                 flexion = max(0.0, values[joint_key] - baseline - deadzone)
                 flexion_deg[finger][joint_key] = flexion
+
+            curl_input_deg = sum(
+                X2_FINGER_CURL_INPUT_WEIGHT[joint_key]
+                * flexion_deg[finger][joint_key]
+                for joint_key in ("mcp", "pip", "dip")
+            )
+            curl = X2_FINGER_CURL_GAIN_RAD_PER_DEG * curl_input_deg
+            curl_rad[finger] = curl
+            curl_distribution = interpolate_x2_finger_curl_distribution(curl)
+            magnitudes_before_mode_gain = {
+                joint_key: curl_distribution[joint_key]
+                * curl
+                * gain_scale.get(joint_key, 1.0)
+                for joint_key in ("mcp", "pip", "dip")
+            }
+            magnitudes = {
+                joint_key: magnitudes_before_mode_gain[joint_key]
+                * mode_gain.get(joint_key, 1.0)
+                for joint_key in ("mcp", "pip", "dip")
+            }
+            distribution_sum = max(
+                sum(curl_distribution[joint_key] for joint_key in ("mcp", "pip", "dip")),
+                1e-6,
+            )
+            curl_rad_after_mode_gain[finger] = sum(magnitudes.values()) / distribution_sum
+            finger_qpos_before_mode_gain[finger] = {
+                joint_lookup[joint_key]: sign * magnitudes_before_mode_gain[joint_key]
+                for joint_key in ("mcp", "pip", "dip")
+            }
+            finger_qpos_after_mode_gain[finger] = {
+                joint_lookup[joint_key]: sign * magnitudes[joint_key]
+                for joint_key in ("mcp", "pip", "dip")
+            }
+            joint_indices = {
+                joint_key: joint_names.index(joint_name)
+                for joint_key, joint_name in joint_lookup.items()
+                if joint_name in joint_names
+            }
+            redistributed = redistribute_x2_finger_curl_near_limits(
+                magnitudes, joint_indices, joint_limits, sign
+            )
+            redistribution[finger] = {
+                joint_key: redistributed[joint_key] - magnitudes[joint_key]
+                for joint_key in ("mcp", "pip", "dip")
+            }
+
+            for joint_key, joint_name in joint_lookup.items():
                 target = (
                     sign
-                    * X2_FINGER_DIRECT_GAIN_RAD_PER_DEG[joint_key]
-                    * gain_scale.get(joint_key, 1.0)
-                    * flexion
+                    * redistributed[joint_key]
                 )
                 if joint_name in joint_names:
                     index = joint_names.index(joint_name)
                     lower, upper = joint_limits[index]
                     clipped_target = float(np.clip(target, lower, upper))
+                    if abs(clipped_target) < X2_FOUR_FINGER_QPOS_DEADBAND:
+                        clipped_target = 0.0
+                    previous = self.previous_direct_qpos.get(joint_name)
+                    if (
+                        previous is not None
+                        and abs(clipped_target - previous)
+                        < X2_FINGER_DIRECT_QPOS_HYSTERESIS
+                    ):
+                        clipped_target = previous
                     direct_qpos[joint_name] = clipped_target
                     clipped[joint_name] = not np.isclose(target, clipped_target)
 
-        if self.smoothed_qpos is None:
-            self.smoothed_qpos = direct_qpos.copy()
-        else:
-            alpha = X2_FINGER_DIRECT_SMOOTHING
-            for joint_name, value in direct_qpos.items():
-                previous = self.smoothed_qpos.get(joint_name, value)
-                self.smoothed_qpos[joint_name] = (
-                    (1.0 - alpha) * previous + alpha * value
-                )
+        self.previous_direct_qpos = direct_qpos.copy()
 
         return {
             "enabled": True,
             "calibrated": calibrated,
             "samples": self.samples,
             "raw_angles": raw_angles,
+            "filtered_angles": angles,
             "baseline": {
                 finger: values.copy() for finger, values in self.baseline.items()
             },
             "flexion_deg": flexion_deg,
-            "direct_qpos": self.smoothed_qpos.copy(),
+            "curl_rad": curl_rad,
+            "curl_rad_after_mode_gain": curl_rad_after_mode_gain,
+            "redistribution": redistribution,
+            "direct_qpos": direct_qpos,
+            "finger_qpos_before_mode_gain": finger_qpos_before_mode_gain,
+            "finger_qpos_after_mode_gain": finger_qpos_after_mode_gain,
             "clipped": clipped,
             "gain_scale": gain_scale.copy(),
+            "mode_finger_gain": mode_gain,
+            "finger_sign": sign,
         }
 
 
@@ -1440,6 +1627,14 @@ def format_x2_finger_direct_mapping(direct_info: dict) -> str:
             )
             + ")"
         )
+    mode_gain = direct_info.get("mode_finger_gain", {})
+    if mode_gain:
+        parts.append(
+            f"mode_finger_gain_mcp={mode_gain.get('mcp', 1.0):.2f} "
+            f"mode_finger_gain_pip={mode_gain.get('pip', 1.0):.2f} "
+            f"mode_finger_gain_dip={mode_gain.get('dip', 1.0):.2f}"
+        )
+    parts.append(f"finger_sign={direct_info.get('finger_sign', 1.0):+.0f}")
     for finger in ("index", "middle", "ring", "pinky"):
         qpos_items = []
         for joint_name in X2_FINGER_DIRECT_JOINTS[finger]:
@@ -1447,10 +1642,32 @@ def format_x2_finger_direct_mapping(direct_info: dict) -> str:
             if value is not None:
                 qpos_items.append(f"{joint_name}:{value:+.3f}")
         flex = direct_info["flexion_deg"].get(finger, {})
+        curl = direct_info.get("curl_rad", {}).get(finger, 0.0)
+        curl_after_gain = direct_info.get("curl_rad_after_mode_gain", {}).get(
+            finger, curl
+        )
+        before_gain = direct_info.get("finger_qpos_before_mode_gain", {}).get(
+            finger, {}
+        )
+        after_gain = direct_info.get("finger_qpos_after_mode_gain", {}).get(
+            finger, {}
+        )
         parts.append(
-            f"{finger}[mcp={flex.get('mcp', 0.0):.1f},"
+            f"{finger}[curl={curl:.3f};"
+            f"finger_curl_before_mode_gain={curl:.3f};"
+            f"finger_curl_after_mode_gain={curl_after_gain:.3f};"
+            f"mcp={flex.get('mcp', 0.0):.1f},"
             f"pip={flex.get('pip', 0.0):.1f},"
             f"dip={flex.get('dip', 0.0):.1f}; "
+            "finger_qpos_before_mode_gain="
+            + ",".join(
+                f"{joint}:{value:+.3f}" for joint, value in before_gain.items()
+            )
+            + "; finger_qpos_after_mode_gain="
+            + ",".join(
+                f"{joint}:{value:+.3f}" for joint, value in after_gain.items()
+            )
+            + "; final="
             + ",".join(qpos_items)
             + "]"
         )
@@ -1470,14 +1687,37 @@ def apply_x2_four_finger_coupling(
     output = qpos.copy()
     strength = float(np.clip(strength, 0.0, 1.0))
     details = {}
+
+    def blend_if_more_flexed(current: float, desired: float) -> float:
+        if abs(desired) <= abs(current):
+            return current
+        if abs(current) > 1e-6 and np.sign(current) != np.sign(desired):
+            return current
+        return (1.0 - strength) * current + strength * desired
+
     for finger, (mcp_joint, pip_joint, dip_joint) in X2_FINGER_DIRECT_JOINTS.items():
         if mcp_joint not in joint_names or pip_joint not in joint_names:
             continue
         mcp_index = joint_names.index(mcp_joint)
         pip_index = joint_names.index(pip_joint)
+        if abs(output[mcp_index]) < X2_FOUR_FINGER_QPOS_DEADBAND:
+            if dip_joint in joint_names:
+                dip_index = joint_names.index(dip_joint)
+                details[finger] = {
+                    "mcp": float(output[mcp_index]),
+                    "pip": float(output[pip_index]),
+                    "dip": float(output[dip_index]),
+                }
+            else:
+                details[finger] = {
+                    "mcp": float(output[mcp_index]),
+                    "pip": float(output[pip_index]),
+                }
+            continue
+
         desired_pip = X2_FINGER_COUPLING_PIP_PER_MCP * output[mcp_index]
-        output[pip_index] = (
-            (1.0 - strength) * output[pip_index] + strength * desired_pip
+        output[pip_index] = blend_if_more_flexed(
+            float(output[pip_index]), float(desired_pip)
         )
         output[pip_index] = np.clip(
             output[pip_index], joint_limits[pip_index, 0], joint_limits[pip_index, 1]
@@ -1486,8 +1726,8 @@ def apply_x2_four_finger_coupling(
         if dip_joint in joint_names:
             dip_index = joint_names.index(dip_joint)
             desired_dip = X2_FINGER_COUPLING_DIP_PER_PIP * output[pip_index]
-            output[dip_index] = (
-                (1.0 - strength) * output[dip_index] + strength * desired_dip
+            output[dip_index] = blend_if_more_flexed(
+                float(output[dip_index]), float(desired_dip)
             )
             output[dip_index] = np.clip(
                 output[dip_index],
@@ -1569,43 +1809,6 @@ def compute_x2_pinch_strength(
     return max(strengths, default=0.0)
 
 
-def apply_x2_thumb_pinch_synergy(
-    qpos: np.ndarray,
-    joint_names: list[str],
-    joint_limits: np.ndarray,
-    profile: Optional[str],
-    pinch_strength: float,
-    target_qpos: dict[str, float],
-    preserve_joints: Optional[set[str]] = None,
-) -> np.ndarray:
-    if not is_x2_profile_enabled(profile) or pinch_strength <= 0:
-        return qpos
-
-    output = qpos.copy()
-    preserve_joints = preserve_joints or set()
-    strength = float(np.clip(pinch_strength, 0.0, 1.0))
-    for joint_name, target in target_qpos.items():
-        if joint_name in preserve_joints:
-            continue
-        if joint_name not in joint_names:
-            continue
-        index = joint_names.index(joint_name)
-        lower, upper = joint_limits[index]
-        target = float(np.clip(target, lower, upper))
-        blended = (1.0 - strength) * output[index] + strength * target
-        if joint_name == "rh_THJ4":
-            output[index] = (
-                max(output[index], blended)
-                if target >= 0
-                else min(output[index], blended)
-            )
-        elif joint_name == "rh_THJ2":
-            output[index] = min(output[index], blended)
-        else:
-            output[index] = blended
-    return output
-
-
 def thumb_flexion_angle_deg(
     points: np.ndarray,
     a: int,
@@ -1654,14 +1857,353 @@ def thumb_palm_projection_flexion_deg(points: np.ndarray) -> float:
     return max(0.0, 180.0 - angle) * X2_THUMB_ROOT_PALM_PROJECTION_SCALE
 
 
-def compute_x2_thumb_raw_angles(joint_pos: np.ndarray) -> dict[str, float]:
+def safe_unit_vector(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(vector)
+    if norm < 1e-8:
+        fallback_norm = np.linalg.norm(fallback)
+        if fallback_norm < 1e-8:
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+        return fallback / fallback_norm
+    return vector / norm
+
+
+def compute_x2_thj4_lateral_features(points: np.ndarray) -> dict[str, float]:
+    thumb_tip = points[4]
+    thumb_cmc = points[1]
+    thumb_mcp = points[2]
+    index_tip = points[8]
+    index_mcp = points[5]
+    middle_mcp = points[9]
+    pinky_mcp = points[17]
+    wrist = points[0]
+
+    index_side_raw = index_mcp - pinky_mcp
+    palm_width = max(float(np.linalg.norm(index_side_raw)), 1e-6)
+    index_side_axis = safe_unit_vector(index_side_raw, np.array([0.0, 1.0, 0.0]))
+    finger_forward_axis = safe_unit_vector(
+        middle_mcp - wrist, np.array([0.0, 0.0, 1.0])
+    )
+    palm_normal_axis = safe_unit_vector(
+        np.cross(finger_forward_axis, index_side_axis),
+        np.array([1.0, 0.0, 0.0]),
+    )
+
+    thumb_vec = thumb_tip - thumb_mcp
+    thumb_mcp_from_cmc = thumb_mcp - thumb_cmc
+    thumb_tip_from_cmc = thumb_tip - thumb_cmc
+    side_proj = float(np.dot(thumb_vec, index_side_axis) / palm_width)
+    palm_proj = float(np.dot(thumb_vec, palm_normal_axis) / palm_width)
+    thumb_mcp_side_proj = float(np.dot(thumb_mcp_from_cmc, index_side_axis) / palm_width)
+    thumb_tip_side_proj = float(np.dot(thumb_tip_from_cmc, index_side_axis) / palm_width)
+    thumb_mcp_palm_proj = float(np.dot(thumb_mcp_from_cmc, palm_normal_axis) / palm_width)
+    thumb_tip_palm_proj = float(np.dot(thumb_tip_from_cmc, palm_normal_axis) / palm_width)
+    pinch_distance = float(np.linalg.norm(thumb_tip - index_tip) / palm_width)
+    return {
+        "side_proj": side_proj,
+        "palm_proj": palm_proj,
+        "thumb_mcp_side_proj": thumb_mcp_side_proj,
+        "thumb_tip_side_proj": thumb_tip_side_proj,
+        "thumb_mcp_palm_proj": thumb_mcp_palm_proj,
+        "thumb_tip_palm_proj": thumb_tip_palm_proj,
+        "pinch_distance": pinch_distance,
+    }
+
+
+def normalize_positive_delta(value: float, low: float, high: float) -> float:
+    if high <= low:
+        return 0.0
+    return float(np.clip((value - low) / (high - low), 0.0, 1.0))
+
+
+def interpolate_scalar(
+    value: float,
+    in_low: float,
+    in_high: float,
+    out_low: float,
+    out_high: float,
+) -> float:
+    if in_high <= in_low:
+        return out_low
+    ratio = float(np.clip((value - in_low) / (in_high - in_low), 0.0, 1.0))
+    return out_low + ratio * (out_high - out_low)
+
+
+def smoothstep_scalar(edge0: float, edge1: float, value: float) -> float:
+    if edge1 <= edge0:
+        return 0.0
+    x = float(np.clip((value - edge0) / (edge1 - edge0), 0.0, 1.0))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def x2_thj4_opposition_amount(
+    progress: float,
+    max_amount: float = X2_THUMB_DIRECT_MAX_MAGNITUDE["rh_THJ4"],
+) -> float:
+    if progress < X2_THJ4_OPPOSITION_GATE:
+        return 0.0
+    if progress < X2_THJ4_EARLY_PROGRESS:
+        ratio = (progress - X2_THJ4_OPPOSITION_GATE) / (
+            X2_THJ4_EARLY_PROGRESS - X2_THJ4_OPPOSITION_GATE
+        )
+        return interpolate_scalar(
+            max(0.0, ratio) ** 0.75,
+            0.0,
+            1.0,
+            0.12,
+            X2_THJ4_EARLY_AMOUNT,
+        )
+    ratio = (min(progress, 1.0) - X2_THJ4_EARLY_PROGRESS) / (
+        1.0 - X2_THJ4_EARLY_PROGRESS
+    )
+    return interpolate_scalar(
+        max(0.0, ratio) ** 0.45,
+        0.0,
+        1.0,
+        X2_THJ4_EARLY_AMOUNT,
+        max_amount,
+    )
+
+
+def compute_x2_thj4_opposition_progress(
+    features: dict[str, float],
+    baseline: dict[str, float],
+    control_mode: str,
+) -> dict[str, float | bool]:
+    side_delta = features["side_proj"] - baseline["side_proj"]
+    palm_delta = features["palm_proj"] - baseline["palm_proj"]
+    base_side_delta = (
+        features["thumb_mcp_side_proj"] - baseline["thumb_mcp_side_proj"]
+    )
+    tip_side_delta = (
+        features["thumb_tip_side_proj"] - baseline["thumb_tip_side_proj"]
+    )
+    base_palm_delta = (
+        features["thumb_mcp_palm_proj"] - baseline["thumb_mcp_palm_proj"]
+    )
+    tip_palm_delta = (
+        features["thumb_tip_palm_proj"] - baseline["thumb_tip_palm_proj"]
+    )
+    pinch_delta = baseline.get("pinch_distance", features["pinch_distance"]) - features[
+        "pinch_distance"
+    ]
+    side_polarity = -1.0 if control_mode == "left_mode" else 1.0
+    weighted_palm_delta = (
+        X2_THJ4_BASE_SIDE_WEIGHT * base_palm_delta
+        + X2_THJ4_TIP_SIDE_WEIGHT * tip_palm_delta
+    )
+    effective_base_side_delta = side_polarity * base_side_delta
+    effective_tip_side_delta = side_polarity * tip_side_delta
+    effective_side_delta = (
+        X2_THJ4_BASE_SIDE_WEIGHT * effective_base_side_delta
+        + X2_THJ4_TIP_SIDE_WEIGHT * effective_tip_side_delta
+    )
+    effective_palm_delta = weighted_palm_delta
+    side_abs_fallback = False
+    palm_abs_fallback = False
+
+    base_side_abs_fallback = False
+    tip_side_abs_fallback = False
+    if (
+        effective_base_side_delta < X2_THJ4_SIDE_DEADZONE
+        and abs(base_side_delta) >= X2_THJ4_SIDE_DEADZONE
+    ):
+        effective_base_side_delta = abs(base_side_delta)
+        base_side_abs_fallback = True
+    if (
+        effective_tip_side_delta < X2_THJ4_SIDE_DEADZONE
+        and abs(tip_side_delta) >= X2_THJ4_SIDE_DEADZONE
+    ):
+        effective_tip_side_delta = abs(tip_side_delta)
+        tip_side_abs_fallback = True
+
+    effective_side_delta = (
+        X2_THJ4_BASE_SIDE_WEIGHT * effective_base_side_delta
+        + X2_THJ4_TIP_SIDE_WEIGHT * effective_tip_side_delta
+    )
+    if (
+        effective_side_delta < X2_THJ4_SIDE_DEADZONE
+        and (base_side_abs_fallback or tip_side_abs_fallback)
+    ):
+        side_abs_fallback = True
+
+    if (
+        effective_palm_delta < X2_THJ4_PALM_DEADZONE
+        and abs(weighted_palm_delta) >= X2_THJ4_PALM_DEADZONE
+    ):
+        effective_palm_delta = abs(weighted_palm_delta)
+        palm_abs_fallback = True
+
+    base_side_progress = normalize_positive_delta(
+        effective_base_side_delta,
+        X2_THJ4_SIDE_DEADZONE,
+        X2_THJ4_SIDE_HIGH,
+    )
+    tip_side_progress = normalize_positive_delta(
+        effective_tip_side_delta,
+        X2_THJ4_SIDE_DEADZONE,
+        X2_THJ4_SIDE_HIGH,
+    )
+    side_progress = normalize_positive_delta(
+        effective_side_delta,
+        X2_THJ4_SIDE_DEADZONE,
+        X2_THJ4_SIDE_HIGH,
+    )
+    palm_progress = normalize_positive_delta(
+        effective_palm_delta,
+        X2_THJ4_PALM_DEADZONE,
+        X2_THJ4_PALM_HIGH,
+    )
+    gate_progress_raw = (
+        0.45 * base_side_progress
+        + 0.40 * tip_side_progress
+        + 0.15 * palm_progress
+    )
+    amount_progress_raw = (
+        X2_THJ4_AMOUNT_BASE_WEIGHT * base_side_progress
+        + X2_THJ4_AMOUNT_PALM_WEIGHT * palm_progress
+        + X2_THJ4_AMOUNT_TIP_WEIGHT * tip_side_progress
+    )
+    pinch_aux = 0.0
+    if gate_progress_raw > X2_THJ4_OPPOSITION_GATE * 0.5:
+        pinch_progress = normalize_positive_delta(max(0.0, pinch_delta), 0.010, 0.120)
+        pinch_aux = min(0.035, X2_THJ4_PINCH_AUX_WEIGHT * pinch_progress)
+    gate_progress = float(np.clip(gate_progress_raw + pinch_aux, 0.0, 1.0))
+    amount_progress_clamped = float(np.clip(amount_progress_raw, 0.0, 1.0))
+    gate_open = gate_progress >= X2_THJ4_OPPOSITION_GATE
+    return {
+        "side_delta": float(side_delta),
+        "palm_delta": float(palm_delta),
+        "base_side_delta": float(base_side_delta),
+        "tip_side_delta": float(tip_side_delta),
+        "base_palm_delta": float(base_palm_delta),
+        "tip_palm_delta": float(tip_palm_delta),
+        "effective_side_delta": float(effective_side_delta),
+        "effective_base_side_delta": float(effective_base_side_delta),
+        "effective_tip_side_delta": float(effective_tip_side_delta),
+        "effective_palm_delta": float(effective_palm_delta),
+        "base_side_progress": float(base_side_progress),
+        "tip_side_progress": float(tip_side_progress),
+        "side_progress": float(side_progress),
+        "palm_progress": float(palm_progress),
+        "gate_progress_raw": float(gate_progress_raw),
+        "gate_progress": float(gate_progress),
+        "amount_progress_raw": float(amount_progress_raw),
+        "amount_progress_clamped": float(amount_progress_clamped),
+        "lateral_progress": float(gate_progress),
+        "pinch_aux": float(pinch_aux),
+        "opposition_progress": float(gate_progress),
+        "gate_open": bool(gate_open),
+        "side_abs_fallback": bool(side_abs_fallback),
+        "base_side_abs_fallback": bool(base_side_abs_fallback),
+        "tip_side_abs_fallback": bool(tip_side_abs_fallback),
+        "palm_abs_fallback": bool(palm_abs_fallback),
+    }
+
+
+def compute_x2_thumb_raw_controls(
+    joint_pos: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float]]:
     thj3_basal = thumb_flexion_angle_deg(joint_pos, 0, 1, 2)
     thj3_palm_projection = thumb_palm_projection_flexion_deg(joint_pos)
+    thj4_features = compute_x2_thj4_lateral_features(joint_pos)
+    return (
+        {
+            "rh_THJ4": thj4_features["side_proj"],
+            "rh_THJ3": max(thj3_basal, thj3_palm_projection),
+            "rh_THJ2": thumb_flexion_angle_deg(joint_pos, 1, 2, 3),
+            "rh_THJ1": thumb_flexion_angle_deg(joint_pos, 2, 3, 4),
+        },
+        thj4_features,
+    )
+
+
+def get_x2_thumb_sign_table(control_mode: str) -> dict[str, float]:
     return {
-        "rh_THJ3": max(thj3_basal, thj3_palm_projection),
-        "rh_THJ2": thumb_flexion_angle_deg(joint_pos, 1, 2, 3),
-        "rh_THJ1": thumb_flexion_angle_deg(joint_pos, 2, 3, 4),
+        "rh_THJ4": -1.0 if control_mode == "left_mode" else 1.0,
+        "rh_THJ3": -1.0,
+        "rh_THJ2": -1.0,
+        "rh_THJ1": -1.0,
     }
+
+
+def x2_thumb_qpos_map(qpos: np.ndarray, joint_names: list[str]) -> dict[str, float]:
+    return {
+        joint_name: float(qpos[joint_names.index(joint_name)])
+        for joint_name in X2_THUMB_DIRECT_JOINTS
+        if joint_name in joint_names
+    }
+
+
+def x2_thumb_debug_prefix(joint_name: str) -> str:
+    return joint_name.split("_")[-1].lower()
+
+
+def get_x2_thumb_direct_max_magnitude(
+    joint_name: str,
+    joint_names: list[str],
+    joint_limits: np.ndarray,
+) -> float:
+    default_max = X2_THUMB_DIRECT_MAX_MAGNITUDE[joint_name]
+    if joint_name not in joint_names:
+        return default_max
+    joint_index = joint_names.index(joint_name)
+    lower, upper = joint_limits[joint_index]
+    limit_abs = min(abs(float(lower)), abs(float(upper)))
+    if limit_abs <= 0.0:
+        return default_max
+    return min(default_max, 0.90 * limit_abs)
+
+
+def compute_x2_thj4_dynamic_max(
+    static_max: float,
+    amount_progress: float,
+    thumb_flexion_progress: float,
+    thumb_distal_flexion_progress: float,
+) -> float:
+    opposition_weight = smoothstep_scalar(
+        X2_THJ4_SOFT_PROGRESS_START,
+        X2_THJ4_SOFT_PROGRESS_END,
+        amount_progress,
+    )
+    flexion_progress = max(
+        float(thumb_flexion_progress),
+        0.65 * float(thumb_distal_flexion_progress),
+    )
+    flexion_weight = smoothstep_scalar(
+        X2_THJ4_SOFT_FLEXION_LOW_DEG,
+        X2_THJ4_SOFT_FLEXION_HIGH_DEG,
+        flexion_progress,
+    )
+    soft_cap = min(static_max, X2_THJ4_SOFT_MAX_LOW_FLEXION)
+    high_opposition_cap = soft_cap + flexion_weight * (static_max - soft_cap)
+    return float(
+        (1.0 - opposition_weight) * static_max
+        + opposition_weight * high_opposition_cap
+    )
+
+
+def compute_x2_thumb_coordination_progress(amount_progress: float) -> float:
+    return smoothstep_scalar(
+        X2_THUMB_COORDINATION_PROGRESS_START,
+        X2_THUMB_COORDINATION_PROGRESS_END,
+        amount_progress,
+    )
+
+
+def project_x2_thumb_qpos_to_sign_convention(
+    qpos: np.ndarray,
+    joint_names: list[str],
+    joint_limits: np.ndarray,
+    sign_table: dict[str, float],
+) -> np.ndarray:
+    projected = qpos.copy()
+    for joint_name, sign in sign_table.items():
+        if joint_name not in joint_names:
+            continue
+        index = joint_names.index(joint_name)
+        lower, upper = joint_limits[index]
+        projected[index] = np.clip(sign * abs(float(projected[index])), lower, upper)
+    return projected
 
 
 class X2ThumbDirectMappingState:
@@ -1670,7 +2212,37 @@ class X2ThumbDirectMappingState:
 
     def reset(self) -> None:
         self.baseline: Optional[dict[str, float]] = None
+        self.filtered_controls: Optional[dict[str, float]] = None
+        self.thj4_baseline_features: Optional[dict[str, float]] = None
+        self.filtered_thj4_features: Optional[dict[str, float]] = None
+        self.filtered_feature_values: Optional[dict[str, float]] = None
+        self.feature_ema_valid = False
+        self.left_hand_detected_previous = False
+        self.last_feature_ema_reset = False
         self.samples = 0
+
+    def smooth_feature_values(self, raw_values: dict[str, float]) -> dict[str, float]:
+        if self.filtered_feature_values is None or not self.feature_ema_valid:
+            self.filtered_feature_values = raw_values.copy()
+            self.feature_ema_valid = True
+            self.last_feature_ema_reset = True
+        else:
+            self.last_feature_ema_reset = False
+            alpha = X2_THUMB_FEATURE_EMA_ALPHA
+            for key, value in raw_values.items():
+                previous = self.filtered_feature_values.get(key, value)
+                self.filtered_feature_values[key] = (
+                    alpha * value + (1.0 - alpha) * previous
+                )
+        return self.filtered_feature_values.copy()
+
+    def mark_hand_lost(self) -> None:
+        self.filtered_controls = None
+        self.filtered_thj4_features = None
+        self.filtered_feature_values = None
+        self.feature_ema_valid = False
+        self.left_hand_detected_previous = False
+        self.last_feature_ema_reset = False
 
     def update(
         self,
@@ -1678,42 +2250,94 @@ class X2ThumbDirectMappingState:
         profile: Optional[str],
         joint_names: list[str],
         joint_limits: np.ndarray,
+        control_mode: str,
     ) -> dict:
         if (
             not is_x2_profile_enabled(profile)
             or joint_pos is None
-            or len(joint_pos) <= 4
+            or len(joint_pos) <= 17
         ):
             return {"enabled": False}
 
-        raw_angles = compute_x2_thumb_raw_angles(joint_pos)
+        left_hand_detected_previous = self.left_hand_detected_previous
+        left_hand_detected_current = True
+        reacquired = not left_hand_detected_previous
+        raw_controls, raw_thj4_features = compute_x2_thumb_raw_controls(joint_pos)
+        self.filtered_controls = raw_controls.copy()
+        self.filtered_thj4_features = raw_thj4_features.copy()
+        controls = self.filtered_controls.copy()
+        thj4_features = self.filtered_thj4_features.copy()
         if self.baseline is None:
-            self.baseline = raw_angles.copy()
+            self.baseline = controls.copy()
+            self.thj4_baseline_features = thj4_features.copy()
             self.samples = 1
         elif self.samples < X2_THUMB_DIRECT_BASELINE_FRAMES:
             for joint_name in X2_THUMB_DIRECT_JOINTS:
+                if joint_name == "rh_THJ4":
+                    continue
                 self.baseline[joint_name] = min(
-                    self.baseline[joint_name], raw_angles[joint_name]
+                    self.baseline[joint_name], controls[joint_name]
                 )
+            baseline_count = max(self.samples, 1)
+            for key, value in thj4_features.items():
+                self.thj4_baseline_features[key] = (
+                    baseline_count * self.thj4_baseline_features[key] + value
+                ) / (baseline_count + 1)
             self.samples += 1
-        else:
-            for joint_name in X2_THUMB_DIRECT_JOINTS:
-                if raw_angles[joint_name] < self.baseline[joint_name]:
-                    self.baseline[joint_name] = (
-                        0.85 * self.baseline[joint_name]
-                        + 0.15 * raw_angles[joint_name]
-                    )
 
         calibrated = self.samples >= X2_THUMB_DIRECT_BASELINE_FRAMES
-        flexion_deg = {}
+        control_amount = {}
         direct_qpos = {}
         clipped = {}
+        sign_table = get_x2_thumb_sign_table(control_mode)
+        direct_max_magnitude = {
+            joint_name: get_x2_thumb_direct_max_magnitude(
+                joint_name, joint_names, joint_limits
+            )
+            for joint_name in X2_THUMB_DIRECT_JOINTS
+        }
+        thj4_progress = compute_x2_thj4_opposition_progress(
+            thj4_features, self.thj4_baseline_features, control_mode
+        )
+        thumb_flexion_progress_for_leak = max(
+            0.0,
+            controls["rh_THJ2"] - self.baseline["rh_THJ2"],
+            controls["rh_THJ1"] - self.baseline["rh_THJ1"],
+        )
+        thj4_base_motion = max(
+            abs(thj4_progress.get("base_side_delta", 0.0)),
+            abs(thj4_progress.get("base_palm_delta", 0.0)),
+        )
+        flexion_leak_check = (
+            thumb_flexion_progress_for_leak > 8.0
+            and thj4_base_motion < 0.018
+        )
+        if flexion_leak_check:
+            thj4_progress["gate_open"] = False
+            thj4_progress["gate_closed_by_flexion_leak"] = True
+        else:
+            thj4_progress["gate_closed_by_flexion_leak"] = False
         for joint_name in X2_THUMB_DIRECT_JOINTS:
-            baseline = self.baseline[joint_name]
-            deadzone = X2_THUMB_DIRECT_DEADZONE_DEG[joint_name]
-            flexion = max(0.0, raw_angles[joint_name] - baseline - deadzone)
-            flexion_deg[joint_name] = flexion
-            target = -X2_THUMB_DIRECT_GAIN_RAD_PER_DEG[joint_name] * flexion
+            if joint_name == "rh_THJ4":
+                amount = (
+                    x2_thj4_opposition_amount(
+                        float(thj4_progress["amount_progress_clamped"]),
+                        direct_max_magnitude["rh_THJ4"],
+                    )
+                    if thj4_progress["gate_open"]
+                    else 0.0
+                )
+                thj4_progress["amount_curve_output"] = float(amount)
+            else:
+                baseline = self.baseline[joint_name]
+                deadzone = X2_THUMB_DIRECT_DEADZONE[joint_name]
+                amount = max(0.0, controls[joint_name] - baseline - deadzone)
+            control_amount[joint_name] = amount
+            magnitude = min(
+                X2_THUMB_DIRECT_GAIN[joint_name] * amount,
+                direct_max_magnitude[joint_name],
+            )
+            target = sign_table[joint_name] * magnitude
             if joint_name in joint_names:
                 index = joint_names.index(joint_name)
                 lower, upper = joint_limits[index]
@@ -1724,14 +2348,136 @@ class X2ThumbDirectMappingState:
                 direct_qpos[joint_name] = 0.0
                 clipped[joint_name] = False
 
+        raw_direct_qpos = direct_qpos.copy()
+        raw_feature_values = {
+            "thj4_gate_progress": float(thj4_progress.get("gate_progress", 0.0)),
+            "thj4_amount_progress_clamped": float(
+                thj4_progress.get("amount_progress_clamped", 0.0)
+            ),
+            "thumb_flexion_progress": float(control_amount.get("rh_THJ2", 0.0)),
+            "thumb_distal_flexion_progress": float(
+                control_amount.get("rh_THJ1", 0.0)
+            ),
+        }
+        smooth_feature_values = self.smooth_feature_values(raw_feature_values)
+        self.left_hand_detected_previous = True
+        thj4_progress["gate_progress_raw"] = raw_feature_values[
+            "thj4_gate_progress"
+        ]
+        thj4_progress["gate_progress_smooth"] = smooth_feature_values[
+            "thj4_gate_progress"
+        ]
+        thj4_progress["amount_progress_smooth"] = smooth_feature_values[
+            "thj4_amount_progress_clamped"
+        ]
+        thj4_progress["amount_progress_used"] = float(
+            np.clip(smooth_feature_values["thj4_amount_progress_clamped"], 0.0, 1.0)
+        )
+        thj4_dynamic_max = compute_x2_thj4_dynamic_max(
+            direct_max_magnitude["rh_THJ4"],
+            thj4_progress["amount_progress_used"],
+            smooth_feature_values["thumb_flexion_progress"],
+            smooth_feature_values["thumb_distal_flexion_progress"],
+        )
+        thj4_progress["dynamic_max"] = float(thj4_dynamic_max)
+        thj4_progress["static_max"] = float(direct_max_magnitude["rh_THJ4"])
+        thj4_progress["gate_open_raw"] = bool(thj4_progress["gate_open"])
+        thj4_progress["gate_open"] = (
+            smooth_feature_values["thj4_gate_progress"] >= X2_THJ4_OPPOSITION_GATE
+        )
+        if flexion_leak_check:
+            thj4_progress["gate_open"] = False
+
+        if "rh_THJ4" in direct_qpos:
+            amount = (
+                x2_thj4_opposition_amount(
+                    thj4_progress["amount_progress_used"],
+                    thj4_dynamic_max,
+                )
+                if thj4_progress["gate_open"]
+                else 0.0
+            )
+            thj4_progress["amount_curve_output"] = float(amount)
+            control_amount["rh_THJ4"] = amount
+            index = joint_names.index("rh_THJ4") if "rh_THJ4" in joint_names else None
+            if index is not None:
+                lower, upper = joint_limits[index]
+                direct_qpos["rh_THJ4"] = float(
+                    np.clip(sign_table["rh_THJ4"] * amount, lower, upper)
+                )
+        for joint_name, feature_key in (
+            ("rh_THJ2", "thumb_flexion_progress"),
+            ("rh_THJ1", "thumb_distal_flexion_progress"),
+        ):
+            if joint_name not in direct_qpos or joint_name not in joint_names:
+                continue
+            index = joint_names.index(joint_name)
+            lower, upper = joint_limits[index]
+            raw_amount = raw_feature_values[feature_key]
+            smooth_amount = smooth_feature_values[feature_key]
+            raw_qpos = sign_table[joint_name] * min(
+                X2_THUMB_DIRECT_GAIN[joint_name] * raw_amount,
+                direct_max_magnitude[joint_name],
+            )
+            smooth_qpos = sign_table[joint_name] * min(
+                X2_THUMB_DIRECT_GAIN[joint_name] * smooth_amount,
+                direct_max_magnitude[joint_name],
+            )
+            direct_qpos[joint_name] = float(
+                np.clip(smooth_qpos, lower, upper)
+            )
+            prefix = x2_thumb_debug_prefix(joint_name)
+            thj_debug_raw = float(np.clip(raw_qpos, lower, upper))
+            thj_debug_smooth = direct_qpos[joint_name]
+            raw_feature_values[f"{prefix}_direct_qpos_from_raw_progress"] = (
+                thj_debug_raw
+            )
+            smooth_feature_values[f"{prefix}_direct_qpos_from_smooth_progress"] = (
+                thj_debug_smooth
+            )
+
         return {
             "enabled": True,
             "calibrated": calibrated,
             "samples": self.samples,
-            "raw_angles": raw_angles,
+            "raw_controls": raw_controls,
+            "filtered_controls": controls,
+            "thj4_features": thj4_features,
+            "thj4_baseline_features": self.thj4_baseline_features.copy(),
+            "thj4_progress": thj4_progress,
+            "thj4_flexion_leak_check": bool(flexion_leak_check),
+            "thumb_flexion_progress": float(
+                smooth_feature_values["thumb_flexion_progress"]
+            ),
+            "thumb_flexion_progress_raw": float(
+                raw_feature_values["thumb_flexion_progress"]
+            ),
+            "thumb_flexion_progress_smooth": float(
+                smooth_feature_values["thumb_flexion_progress"]
+            ),
+            "thumb_distal_flexion_progress": float(
+                smooth_feature_values["thumb_distal_flexion_progress"]
+            ),
+            "thumb_distal_flexion_progress_raw": float(
+                raw_feature_values["thumb_distal_flexion_progress"]
+            ),
+            "thumb_distal_flexion_progress_smooth": float(
+                smooth_feature_values["thumb_distal_flexion_progress"]
+            ),
+            "thumb_feature_smooth_alpha": X2_THUMB_FEATURE_EMA_ALPHA,
+            "thumb_feature_raw_values": raw_feature_values,
+            "thumb_feature_smooth_values": smooth_feature_values,
+            "direct_qpos_raw": raw_direct_qpos,
+            "thumb_direct_max_magnitude": direct_max_magnitude,
+            "left_hand_detected_current": left_hand_detected_current,
+            "left_hand_detected_previous": left_hand_detected_previous,
+            "x2_thumb_feature_ema_valid": self.feature_ema_valid,
+            "thumb_feature_ema_reset": bool(reacquired or self.last_feature_ema_reset),
             "baseline": self.baseline.copy(),
-            "flexion_deg": flexion_deg,
+            "control_amount": control_amount,
             "direct_qpos": direct_qpos,
+            "thumb_sign_table": sign_table,
+            "control_mode": control_mode,
             "clipped": clipped,
         }
 
@@ -1741,6 +2487,10 @@ def apply_x2_thumb_direct_mapping(
     joint_names: list[str],
     profile: Optional[str],
     direct_info: dict,
+    control_mode: str,
+    retargeting=None,
+    target_ref_value: Optional[np.ndarray] = None,
+    joint_limits: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     if (
         not is_x2_profile_enabled(profile)
@@ -1749,14 +2499,300 @@ def apply_x2_thumb_direct_mapping(
     ):
         return qpos
 
-    output = qpos.copy()
+    if joint_limits is None:
+        direct_info["selection"] = {
+            "selected_source": "solver_raw",
+            "reason": "missing_joint_limits",
+        }
+        return qpos
+
+    sign_table = get_x2_thumb_sign_table(control_mode)
+    solver_raw = qpos.copy()
+    solver_projected = project_x2_thumb_qpos_to_sign_convention(
+        qpos, joint_names, joint_limits, sign_table
+    )
+    thj4_gate_open = bool(
+        direct_info.get("thj4_progress", {}).get("gate_open", True)
+    )
+    thj4_amount_progress_used = float(
+        direct_info.get("thj4_progress", {}).get("amount_progress_used", 0.0)
+    )
+    thumb_coordination_progress = (
+        compute_x2_thumb_coordination_progress(thj4_amount_progress_used)
+        if thj4_gate_open
+        else 0.0
+    )
+    direct_info["thumb_coordination_progress"] = float(thumb_coordination_progress)
+    if not thj4_gate_open and "rh_THJ4" in joint_names:
+        thj4_index = joint_names.index("rh_THJ4")
+        solver_projected[thj4_index] = 0.0
+    direct_signed = solver_projected.copy()
+    active_joints = []
     for joint_name, target in direct_info["direct_qpos"].items():
+        if joint_name == "rh_THJ4":
+            continue
         if joint_name not in joint_names:
             continue
+        if (
+            direct_info["control_amount"].get(joint_name, 0.0)
+            < X2_THUMB_DIRECT_MIN_AMOUNT.get(joint_name, 0.0)
+        ):
+            continue
+        magnitude = abs(float(target))
+        if magnitude < 1e-6:
+            continue
         index = joint_names.index(joint_name)
-        blend = X2_THUMB_DIRECT_BLEND[joint_name]
-        output[index] = (1.0 - blend) * output[index] + blend * target
+        lower, upper = joint_limits[index]
+        signed_target = float(np.clip(sign_table[joint_name] * magnitude, lower, upper))
+        direct_signed[index] = signed_target
+        active_joints.append((joint_name, index))
+
+    def apply_thj4_channel(candidate_qpos: np.ndarray) -> np.ndarray:
+        output = candidate_qpos.copy()
+        if "rh_THJ4" not in joint_names:
+            direct_info["thj4_source"] = "unavailable"
+            return output
+
+        thj4_index = joint_names.index("rh_THJ4")
+        lower, upper = joint_limits[thj4_index]
+        solver_thj4 = float(solver_projected[thj4_index])
+        direct_thj4 = float(direct_info.get("direct_qpos", {}).get("rh_THJ4", 0.0))
+        if thj4_gate_open:
+            final_thj4 = float(np.clip(direct_thj4, lower, upper))
+            thj4_source = "direct_opposition"
+        else:
+            final_thj4 = 0.0
+            thj4_source = "gate_closed_zero"
+
+        output[thj4_index] = final_thj4
+        direct_info["thj4_source"] = thj4_source
+        direct_info["thj4_solver_projected_qpos"] = solver_thj4
+        direct_info["thj4_direct_qpos"] = direct_thj4
+        direct_info["thj4_final_before_smoothing"] = final_thj4
+        return output
+
+    def apply_thumb_flex_channels(candidate_qpos: np.ndarray) -> np.ndarray:
+        output = candidate_qpos.copy()
+        for joint_name in ("rh_THJ3", "rh_THJ2", "rh_THJ1"):
+            if joint_name not in joint_names:
+                continue
+            joint_index = joint_names.index(joint_name)
+            lower, upper = joint_limits[joint_index]
+            solver_value = float(solver_projected[joint_index])
+            direct_value = float(direct_info.get("direct_qpos", {}).get(joint_name, 0.0))
+            amount = float(direct_info.get("control_amount", {}).get(joint_name, 0.0))
+
+            if joint_name == "rh_THJ1":
+                force_zero = (
+                    amount < X2_THUMB_DIRECT_MIN_AMOUNT[joint_name]
+                    or abs(direct_value) < 0.025
+                )
+                if force_zero:
+                    final_value = 0.0
+                else:
+                    final_value = 0.85 * direct_value + 0.15 * solver_value
+            elif joint_name == "rh_THJ2":
+                force_zero = (
+                    amount < X2_THUMB_DIRECT_MIN_AMOUNT[joint_name]
+                    or abs(direct_value) < 0.025
+                )
+                if force_zero:
+                    final_value = 0.0
+                else:
+                    final_value = 0.70 * direct_value + 0.30 * solver_value
+            else:
+                force_zero = False
+                final_value = 0.70 * direct_value + 0.30 * solver_value
+                final_value = float(np.clip(final_value, -0.25, 0.0))
+
+            final_before_coordination = final_value
+            extra_magnitude = (
+                thumb_coordination_progress
+                * X2_THUMB_COORDINATION_EXTRA.get(joint_name, 0.0)
+            )
+            if extra_magnitude > 1e-6:
+                final_value += sign_table[joint_name] * extra_magnitude
+                force_zero = False
+            if joint_name == "rh_THJ3":
+                final_value = float(np.clip(final_value, -0.25, 0.0))
+            final_value = float(np.clip(final_value, lower, upper))
+            output[joint_index] = final_value
+            prefix = x2_thumb_debug_prefix(joint_name)
+            direct_info[f"{prefix}_direct_qpos"] = direct_value
+            direct_info[f"{prefix}_solver_projected_qpos"] = solver_value
+            direct_info[
+                f"{prefix}_final_before_smoothing_before_coordination"
+            ] = float(final_before_coordination)
+            direct_info[f"{prefix}_extra_from_opposition"] = float(extra_magnitude)
+            direct_info[
+                f"{prefix}_final_before_smoothing_after_coordination"
+            ] = final_value
+            if joint_name in {"rh_THJ2", "rh_THJ1"}:
+                direct_info[f"{prefix}_force_zero"] = bool(force_zero)
+            direct_info[f"{prefix}_final_before_smoothing"] = final_value
+        return output
+
+    if not active_joints:
+        selected = apply_thumb_flex_channels(solver_projected)
+        selected = apply_thj4_channel(selected)
+        direct_info["selection"] = {
+            "selected_source": "solver_projected",
+            "flex_source": "solver_projected",
+            "reason": "no_active_direct_joints",
+        }
+        direct_info["solver_thumb_qpos_raw"] = x2_thumb_qpos_map(solver_raw, joint_names)
+        direct_info["solver_thumb_qpos_projected"] = x2_thumb_qpos_map(
+            solver_projected, joint_names
+        )
+        direct_info["direct_thumb_amount"] = direct_info.get("control_amount", {}).copy()
+        direct_info["direct_thumb_qpos_signed"] = x2_thumb_qpos_map(
+            direct_signed, joint_names
+        )
+        direct_info["selected_thumb_qpos_before_smoothing"] = x2_thumb_qpos_map(
+            selected, joint_names
+        )
+        direct_info["thumb_sign_table"] = sign_table
+        return selected
+
+    blend = solver_projected.copy()
+    for _, index in active_joints:
+        blend[index] = 0.55 * solver_projected[index] + 0.45 * direct_signed[index]
+
+    solver_score = compute_x2_thumb_candidate_score(
+        retargeting, target_ref_value, solver_projected, solver_projected, joint_names
+    )
+    direct_score = compute_x2_thumb_candidate_score(
+        retargeting, target_ref_value, direct_signed, solver_projected, joint_names
+    )
+    blend_score = compute_x2_thumb_candidate_score(
+        retargeting, target_ref_value, blend, solver_projected, joint_names
+    )
+
+    selected = solver_projected
+    selected_source = "solver_projected"
+    selected_score = solver_score
+
+    def clearly_better(candidate_score: Optional[dict], baseline_score: Optional[dict]) -> bool:
+        if candidate_score is None or baseline_score is None:
+            return False
+        candidate = candidate_score["score"]
+        baseline = baseline_score["score"]
+        return (
+            candidate < baseline * (1.0 - X2_THUMB_DIRECT_MIN_RELATIVE_IMPROVEMENT)
+            or baseline - candidate > X2_THUMB_DIRECT_MIN_ABSOLUTE_IMPROVEMENT
+        )
+
+    for source, candidate, score in (
+        ("direct_signed", direct_signed, direct_score),
+        ("blend", blend, blend_score),
+    ):
+        if clearly_better(score, solver_score) and (
+            selected_score is None or score["score"] < selected_score["score"]
+        ):
+            selected = candidate
+            selected_source = source
+            selected_score = score
+
+    selected = apply_thumb_flex_channels(selected)
+    selected = apply_thj4_channel(selected)
+
+    direct_info["selection"] = {
+        "selected_source": selected_source,
+        "flex_source": selected_source,
+        "solver_projected_err": None if solver_score is None else solver_score["score"],
+        "solver_projected_angle": None
+        if solver_score is None
+        else solver_score.get("max_angle", 0.0),
+        "direct_signed_err": None if direct_score is None else direct_score["score"],
+        "direct_signed_angle": None
+        if direct_score is None
+        else direct_score.get("max_angle", 0.0),
+        "blend_err": None if blend_score is None else blend_score["score"],
+        "blend_angle": None if blend_score is None else blend_score.get("max_angle", 0.0),
+        "selected_err": None if selected_score is None else selected_score["score"],
+        "active_joints": [joint_name for joint_name, _ in active_joints],
+    }
+    direct_info["solver_thumb_qpos_raw"] = x2_thumb_qpos_map(solver_raw, joint_names)
+    direct_info["solver_thumb_qpos_projected"] = x2_thumb_qpos_map(
+        solver_projected, joint_names
+    )
+    direct_info["direct_thumb_amount"] = direct_info.get("control_amount", {}).copy()
+    direct_info["direct_thumb_qpos_signed"] = x2_thumb_qpos_map(direct_signed, joint_names)
+    direct_info["selected_thumb_qpos_before_smoothing"] = x2_thumb_qpos_map(
+        selected, joint_names
+    )
+    direct_info["thumb_sign_table"] = sign_table
+    return selected
+
+
+def enforce_x2_thj4_gate_after_smoothing(
+    qpos: np.ndarray,
+    joint_names: list[str],
+    direct_info: dict,
+    smoother: Optional[X2CommandSmoother] = None,
+) -> np.ndarray:
+    output = qpos.copy()
+    if "rh_THJ4" not in joint_names:
+        return output
+
+    thj4_index = joint_names.index("rh_THJ4")
+    gate_open = bool(direct_info.get("thj4_progress", {}).get("gate_open", True))
+    gate_closed_decay = False
+    if (
+        direct_info.get("enabled")
+        and direct_info.get("calibrated")
+        and not gate_open
+    ):
+        output[thj4_index] = 0.0
+        gate_closed_decay = True
+        if (
+            smoother is not None
+            and smoother.previous is not None
+            and len(smoother.previous) == len(output)
+        ):
+            smoother.previous[thj4_index] = output[thj4_index]
+
+    direct_info["thj4_gate_closed_decay"] = bool(gate_closed_decay)
+    direct_info["thj4_after_gate_enforcement"] = float(output[thj4_index])
+    direct_info["thj4_final_after_smoothing"] = float(output[thj4_index])
+    for joint_name in ("rh_THJ3", "rh_THJ2", "rh_THJ1"):
+        if joint_name not in joint_names:
+            continue
+        joint_index = joint_names.index(joint_name)
+        enforced_value = float(output[joint_index])
+        force_zero = False
+        if joint_name == "rh_THJ3":
+            enforced_value = float(np.clip(enforced_value, -0.25, 0.0))
+        elif direct_info.get(f"{x2_thumb_debug_prefix(joint_name)}_force_zero", False):
+            enforced_value = 0.0
+            force_zero = True
+
+        if force_zero or not np.isclose(enforced_value, output[joint_index]):
+            output[joint_index] = enforced_value
+            if (
+                smoother is not None
+                and smoother.previous is not None
+                and len(smoother.previous) == len(output)
+            ):
+                smoother.previous[joint_index] = enforced_value
+
+        direct_info[
+            f"{x2_thumb_debug_prefix(joint_name)}_final_after_smoothing"
+        ] = float(output[joint_index])
     return output
+
+
+def reset_x2_thumb_smoother_state_to_command(
+    smoother: X2CommandSmoother,
+    command_qpos: np.ndarray,
+    joint_names: list[str],
+) -> None:
+    if smoother.previous is None or len(smoother.previous) != len(command_qpos):
+        return
+    for joint_name in X2_THUMB_DIRECT_JOINTS:
+        if joint_name in joint_names:
+            joint_index = joint_names.index(joint_name)
+            smoother.previous[joint_index] = command_qpos[joint_index]
 
 
 def format_x2_thumb_direct_mapping(direct_info: dict) -> str:
@@ -1767,28 +2803,232 @@ def format_x2_thumb_direct_mapping(direct_info: dict) -> str:
             f"calibrating {direct_info.get('samples', 0)}/"
             f"{X2_THUMB_DIRECT_BASELINE_FRAMES}"
         )
+
+    def format_value(name: str, value: float) -> str:
+        if name == "rh_THJ4":
+            return f"{name}:{value:.3f}"
+        return f"{name}:{value:.1f}deg"
+
+    def format_amount(name: str, value: float) -> str:
+        if name == "rh_THJ4":
+            return f"{name}:{value:.3f}"
+        return f"{name}:{value:.1f}deg"
+
+    def format_qpos_map(values: dict) -> str:
+        if not values:
+            return "n/a"
+        return ",".join(
+            f"{name}:{values.get(name, 0.0):+.3f}"
+            for name in X2_THUMB_DIRECT_JOINTS
+            if name in values
+        )
+
+    def format_sign_table(values: dict) -> str:
+        if not values:
+            return "n/a"
+        return ",".join(
+            f"{name}:{values.get(name, 0.0):+.0f}"
+            for name in X2_THUMB_DIRECT_JOINTS
+            if name in values
+        )
+
+    selection = direct_info.get("selection", {})
+    thj4_progress = direct_info.get("thj4_progress", {})
+    thj4_features = direct_info.get("thj4_features", {})
+    thj4_baseline = direct_info.get("thj4_baseline_features", {})
+    direct_qpos = direct_info.get("direct_qpos", {})
+    selection_parts = [
+        f"flex_source={selection.get('flex_source', selection.get('selected_source', 'pending'))}",
+    ]
+    if selection.get("solver_projected_err") is not None:
+        selection_parts.append(
+            f"solver_projected_err={selection.get('solver_projected_err', 0.0):.4f}"
+        )
+    if selection.get("direct_signed_err") is not None:
+        selection_parts.append(
+            f"direct_signed_err={selection.get('direct_signed_err', 0.0):.4f}"
+        )
+    if selection.get("blend_err") is not None:
+        selection_parts.append(f"blend_err={selection.get('blend_err', 0.0):.4f}")
+    if selection.get("selected_err") is not None:
+        selection_parts.append(f"selected_err={selection.get('selected_err', 0.0):.4f}")
+    if selection.get("direct_signed_angle") is not None:
+        selection_parts.append(
+            f"direct_angle={selection.get('direct_signed_angle', 0.0):.1f}"
+        )
+
     return " ".join(
         [
+            f"mode={direct_info.get('control_mode', 'unknown')}",
+            "thumb_sign_table="
+            + format_sign_table(direct_info.get("thumb_sign_table", {})),
+            "left_hand_detected_current="
+            f"{direct_info.get('left_hand_detected_current', False)}",
+            "left_hand_detected_previous="
+            f"{direct_info.get('left_hand_detected_previous', False)}",
+            "x2_thumb_feature_ema_valid="
+            f"{direct_info.get('x2_thumb_feature_ema_valid', False)}",
+            "thumb_feature_ema_reset="
+            f"{direct_info.get('thumb_feature_ema_reset', False)}",
+            f"thj4_source={direct_info.get('thj4_source', 'pending')}",
+            "flex_select(" + ",".join(selection_parts) + ")",
+            "thj4_gate_progress="
+            f"{thj4_progress.get('gate_progress', 0.0):.3f}",
+            "thj4_gate_progress_raw="
+            f"{thj4_progress.get('gate_progress_raw', thj4_progress.get('gate_progress', 0.0)):.3f}",
+            "thj4_gate_progress_smooth="
+            f"{thj4_progress.get('gate_progress_smooth', thj4_progress.get('gate_progress', 0.0)):.3f}",
+            "thj4_amount_progress_raw="
+            f"{thj4_progress.get('amount_progress_raw', 0.0):.3f}",
+            "thj4_amount_progress_smooth="
+            f"{thj4_progress.get('amount_progress_smooth', thj4_progress.get('amount_progress_clamped', 0.0)):.3f}",
+            "thj4_amount_progress_used="
+            f"{thj4_progress.get('amount_progress_used', thj4_progress.get('amount_progress_clamped', 0.0)):.3f}",
+            "thj4_base_side_progress="
+            f"{thj4_progress.get('base_side_progress', 0.0):.3f}",
+            "thj4_tip_side_progress="
+            f"{thj4_progress.get('tip_side_progress', 0.0):.3f}",
+            "thj4_palm_progress="
+            f"{thj4_progress.get('palm_progress', 0.0):.3f}",
+            "thj4_base_weight="
+            f"{X2_THJ4_AMOUNT_BASE_WEIGHT:.2f}",
+            "thj4_tip_weight="
+            f"{X2_THJ4_AMOUNT_TIP_WEIGHT:.2f}",
+            "thj4_amount_curve_output="
+            f"{thj4_progress.get('amount_curve_output', 0.0):.3f}",
+            "thj4_lateral_opposition_progress="
+            f"{thj4_progress.get('lateral_progress', 0.0):.3f}",
+            "thj4_side_proj="
+            f"{thj4_features.get('side_proj', 0.0):+.3f}",
+            "thj4_palm_proj="
+            f"{thj4_features.get('palm_proj', 0.0):+.3f}",
+            "thj4_baseline_side_proj="
+            f"{thj4_baseline.get('side_proj', 0.0):+.3f}",
+            "thj4_baseline_palm_proj="
+            f"{thj4_baseline.get('palm_proj', 0.0):+.3f}",
+            "thj4_side_delta_raw="
+            f"{thj4_progress.get('side_delta', 0.0):+.3f}",
+            "thj4_palm_delta_raw="
+            f"{thj4_progress.get('palm_delta', 0.0):+.3f}",
+            "thj4_effective_side_delta="
+            f"{thj4_progress.get('effective_side_delta', 0.0):+.3f}",
+            "thj4_effective_palm_delta="
+            f"{thj4_progress.get('effective_palm_delta', 0.0):+.3f}",
+            "thj4_base_side_delta="
+            f"{thj4_progress.get('base_side_delta', 0.0):+.3f}",
+            "thj4_tip_side_delta="
+            f"{thj4_progress.get('tip_side_delta', 0.0):+.3f}",
+            "thj4_flexion_leak_check="
+            f"{direct_info.get('thj4_flexion_leak_check', False)}",
+            "thj4_gate_open="
+            f"{thj4_progress.get('gate_open', False)}",
+            "thj4_gate_closed_decay="
+            f"{direct_info.get('thj4_gate_closed_decay', False)}",
+            "thj4_after_gate_enforcement="
+            f"{direct_info.get('thj4_after_gate_enforcement', 0.0):+.3f}",
+            "thj4_dynamic_max="
+            f"{thj4_progress.get('dynamic_max', direct_info.get('thumb_direct_max_magnitude', {}).get('rh_THJ4', 0.0)):.3f}",
+            "thj4_max="
+            f"{direct_info.get('thumb_direct_max_magnitude', {}).get('rh_THJ4', 0.0):.3f}",
+            "thj4_direct_qpos="
+            f"{direct_qpos.get('rh_THJ4', 0.0):+.3f}",
+            "thj4_solver_projected_qpos="
+            f"{direct_info.get('thj4_solver_projected_qpos', 0.0):+.3f}",
+            "thj4_final_before_smoothing="
+            f"{direct_info.get('thj4_final_before_smoothing', 0.0):+.3f}",
+            "thj4_final_after_smoothing="
+            f"{direct_info.get('thj4_final_after_smoothing', 0.0):+.3f}",
+            "thumb_flexion_progress="
+            f"{direct_info.get('thumb_flexion_progress', 0.0):.1f}",
+            "thumb_flexion_progress_raw="
+            f"{direct_info.get('thumb_flexion_progress_raw', 0.0):.1f}",
+            "thumb_flexion_progress_smooth="
+            f"{direct_info.get('thumb_flexion_progress_smooth', 0.0):.1f}",
+            "thumb_distal_flexion_progress="
+            f"{direct_info.get('thumb_distal_flexion_progress', 0.0):.1f}",
+            "thumb_distal_flexion_progress_raw="
+            f"{direct_info.get('thumb_distal_flexion_progress_raw', 0.0):.1f}",
+            "thumb_distal_flexion_progress_smooth="
+            f"{direct_info.get('thumb_distal_flexion_progress_smooth', 0.0):.1f}",
+            "thumb_coordination_progress="
+            f"{direct_info.get('thumb_coordination_progress', 0.0):.3f}",
+            "thj3_direct_qpos="
+            f"{direct_info.get('thj3_direct_qpos', 0.0):+.3f}",
+            "thj3_solver_projected_qpos="
+            f"{direct_info.get('thj3_solver_projected_qpos', 0.0):+.3f}",
+            "thj3_extra_from_opposition="
+            f"{direct_info.get('thj3_extra_from_opposition', 0.0):.3f}",
+            "thj3_final_before_smoothing_after_coordination="
+            f"{direct_info.get('thj3_final_before_smoothing_after_coordination', direct_info.get('thj3_final_before_smoothing', 0.0)):+.3f}",
+            "thj3_final_before_smoothing="
+            f"{direct_info.get('thj3_final_before_smoothing', 0.0):+.3f}",
+            "thj3_final_after_smoothing="
+            f"{direct_info.get('thj3_final_after_smoothing', 0.0):+.3f}",
+            "thj2_direct_qpos="
+            f"{direct_info.get('thj2_direct_qpos', 0.0):+.3f}",
+            "thj2_direct_qpos_from_raw_progress="
+            f"{direct_info.get('thumb_feature_raw_values', {}).get('thj2_direct_qpos_from_raw_progress', 0.0):+.3f}",
+            "thj2_direct_qpos_from_smooth_progress="
+            f"{direct_info.get('thumb_feature_smooth_values', {}).get('thj2_direct_qpos_from_smooth_progress', 0.0):+.3f}",
+            "thj2_direct_qpos_used="
+            f"{direct_info.get('direct_qpos', {}).get('rh_THJ2', 0.0):+.3f}",
+            "thj2_solver_projected_qpos="
+            f"{direct_info.get('thj2_solver_projected_qpos', 0.0):+.3f}",
+            "thj2_extra_from_opposition="
+            f"{direct_info.get('thj2_extra_from_opposition', 0.0):.3f}",
+            "thj2_final_before_smoothing_after_coordination="
+            f"{direct_info.get('thj2_final_before_smoothing_after_coordination', direct_info.get('thj2_final_before_smoothing', 0.0)):+.3f}",
+            "thj2_final_before_smoothing="
+            f"{direct_info.get('thj2_final_before_smoothing', 0.0):+.3f}",
+            "thj2_final_after_smoothing="
+            f"{direct_info.get('thj2_final_after_smoothing', 0.0):+.3f}",
+            "thj1_direct_qpos="
+            f"{direct_info.get('thj1_direct_qpos', 0.0):+.3f}",
+            "thj1_direct_qpos_from_raw_progress="
+            f"{direct_info.get('thumb_feature_raw_values', {}).get('thj1_direct_qpos_from_raw_progress', 0.0):+.3f}",
+            "thj1_direct_qpos_from_smooth_progress="
+            f"{direct_info.get('thumb_feature_smooth_values', {}).get('thj1_direct_qpos_from_smooth_progress', 0.0):+.3f}",
+            "thj1_direct_qpos_used="
+            f"{direct_info.get('direct_qpos', {}).get('rh_THJ1', 0.0):+.3f}",
+            "thj1_solver_projected_qpos="
+            f"{direct_info.get('thj1_solver_projected_qpos', 0.0):+.3f}",
+            "thj1_extra_from_opposition="
+            f"{direct_info.get('thj1_extra_from_opposition', 0.0):.3f}",
+            "thj1_final_before_smoothing_after_coordination="
+            f"{direct_info.get('thj1_final_before_smoothing_after_coordination', direct_info.get('thj1_final_before_smoothing', 0.0)):+.3f}",
+            "thj1_final_before_smoothing="
+            f"{direct_info.get('thj1_final_before_smoothing', 0.0):+.3f}",
+            "thj1_final_after_smoothing="
+            f"{direct_info.get('thj1_final_after_smoothing', 0.0):+.3f}",
+            "thj2_qpos="
+            f"{direct_qpos.get('rh_THJ2', 0.0):+.3f}",
+            "thj1_qpos="
+            f"{direct_qpos.get('rh_THJ1', 0.0):+.3f}",
+            "solver_raw=" + format_qpos_map(direct_info.get("solver_thumb_qpos_raw", {})),
+            "solver_projected="
+            + format_qpos_map(direct_info.get("solver_thumb_qpos_projected", {})),
             "raw="
             + ",".join(
-                f"{name}:{value:.1f}"
-                for name, value in direct_info["raw_angles"].items()
+                format_value(name, value)
+                for name, value in direct_info["raw_controls"].items()
             ),
             "baseline="
             + ",".join(
-                f"{name}:{value:.1f}"
+                format_value(name, value)
                 for name, value in direct_info["baseline"].items()
             ),
-            "flex="
+            "amount="
             + ",".join(
-                f"{name}:{value:.1f}"
-                for name, value in direct_info["flexion_deg"].items()
+                format_amount(name, value)
+                for name, value in direct_info["control_amount"].items()
             ),
-            "qpos="
-            + ",".join(
-                f"{name}:{value:+.3f}"
-                for name, value in direct_info["direct_qpos"].items()
-            ),
+            "direct_signed=" + format_qpos_map(direct_info.get("direct_qpos", {})),
+            "selected_before_smoothing="
+            + format_qpos_map(direct_info.get("selected_thumb_qpos_before_smoothing", {})),
+            "selected_after_smoothing="
+            + format_qpos_map(direct_info.get("selected_thumb_qpos_after_smoothing", {})),
+            "final_mujoco_thumb_qpos="
+            + format_qpos_map(direct_info.get("final_mujoco_thumb_qpos", {})),
         ]
     )
 
@@ -1828,6 +3068,103 @@ def compute_retargeting_robot_vectors(retargeting, robot_qpos: np.ndarray):
     origin_pos = body_pos[origin_indices]
     task_pos = body_pos[task_indices]
     return task_pos - origin_pos, origin_pos, task_pos
+
+
+def compute_x2_thumb_regularity_penalty(
+    candidate_qpos: np.ndarray,
+    reference_qpos: np.ndarray,
+    joint_names: list[str],
+) -> float:
+    penalty = 0.0
+    for joint_name in X2_THUMB_DIRECT_JOINTS:
+        if joint_name not in joint_names:
+            continue
+        index = joint_names.index(joint_name)
+        value = abs(float(candidate_qpos[index]))
+        soft_limit = X2_THUMB_DIRECT_MAX_MAGNITUDE[joint_name]
+        if value > soft_limit:
+            penalty += 0.20 * (value - soft_limit) ** 2
+        penalty += 0.012 * value
+        penalty += 0.030 * abs(float(candidate_qpos[index] - reference_qpos[index]))
+
+    thj4 = abs(float(candidate_qpos[joint_names.index("rh_THJ4")])) if "rh_THJ4" in joint_names else 0.0
+    thj2 = abs(float(candidate_qpos[joint_names.index("rh_THJ2")])) if "rh_THJ2" in joint_names else 0.0
+    thj1 = abs(float(candidate_qpos[joint_names.index("rh_THJ1")])) if "rh_THJ1" in joint_names else 0.0
+    if thj4 > 0.50 and thj2 + thj1 < 0.20:
+        penalty += 0.035
+    if thj2 > 0.50 and thj1 > 0.40:
+        penalty += 0.020
+    return float(penalty)
+
+
+def compute_x2_thumb_candidate_score(
+    retargeting,
+    target_ref_value: Optional[np.ndarray],
+    robot_qpos: np.ndarray,
+    reference_qpos: np.ndarray,
+    joint_names: list[str],
+) -> Optional[dict]:
+    if retargeting is None or target_ref_value is None:
+        return None
+
+    vectors = compute_retargeting_robot_vectors(retargeting, robot_qpos)
+    if vectors is None:
+        return None
+
+    robot_vec, _, _ = vectors
+    optimizer = retargeting.optimizer
+    target_vec = target_ref_value * optimizer.scaling
+    preferred_norm_errors = []
+    preferred_angles = []
+    fallback_errors = []
+    palm_side_penalty = 0.0
+    for i, (origin_link, task_link) in enumerate(
+        zip(optimizer.origin_link_names, optimizer.task_link_names)
+    ):
+        if task_link != "rh_thtip":
+            continue
+        target = target_vec[i]
+        robot = robot_vec[i]
+        norm_error = float(np.linalg.norm(robot - target))
+        angle = 0.0
+        if np.linalg.norm(target) > 1e-6 and np.linalg.norm(robot) > 1e-6:
+            angle = vector_angle_deg(target, robot)
+        if origin_link in {"rh_fftip", "rh_mftip"}:
+            preferred_norm_errors.append(norm_error)
+            preferred_angles.append(angle)
+        elif origin_link == "rh_palm":
+            fallback_errors.append(norm_error + 0.002 * angle)
+            if abs(target[1]) > 1e-6 and abs(robot[1]) > 1e-6:
+                if np.sign(target[1]) != np.sign(robot[1]):
+                    palm_side_penalty += 0.04
+            palm_side_penalty += 0.20 * abs(float(robot[1] - target[1]))
+
+    if preferred_norm_errors:
+        norm_error = float(np.mean(preferred_norm_errors))
+        mean_angle = float(np.mean(preferred_angles))
+        max_angle = float(np.max(preferred_angles))
+        angle_penalty = 0.0020 * mean_angle + 0.0040 * max(0.0, max_angle - 55.0)
+        vector_score = norm_error + angle_penalty + palm_side_penalty
+    elif fallback_errors:
+        norm_error = float(np.mean(fallback_errors))
+        mean_angle = 0.0
+        max_angle = 0.0
+        vector_score = norm_error + palm_side_penalty
+    else:
+        return None
+
+    regularity_penalty = compute_x2_thumb_regularity_penalty(
+        robot_qpos, reference_qpos, joint_names
+    )
+    return {
+        "score": float(vector_score + regularity_penalty),
+        "vector_score": float(vector_score),
+        "norm_error": norm_error,
+        "mean_angle": mean_angle,
+        "max_angle": max_angle,
+        "regularity_penalty": regularity_penalty,
+        "palm_side_penalty": float(palm_side_penalty),
+    }
 
 
 def get_target_vector_groups(retargeting) -> dict[str, list[int]]:
@@ -2035,7 +3372,7 @@ def build_joint_limit_overrides(
         else:
             raise ValueError(
                 f"Invalid retarget joint limit item '{item}'. "
-                "Use e.g. rh_THJ3=-0.95:0.12."
+                "Use e.g. rh_THJ3=-1.31:1.31."
             )
 
         key = key.strip()
@@ -2225,6 +3562,8 @@ def debug_print_joint_retargeting_alignment(
     data: mujoco.MjData,
     joint_limits: np.ndarray,
     limit_margin: float,
+    target_vector_axis_gains: Optional[np.ndarray] = None,
+    x2_left_y_axis_gain: float = 1.0,
 ) -> None:
     optimizer = retargeting.optimizer
     print("\n[joint-retarget-debug]", f"frame={frame_id}", flush=True)
@@ -2240,25 +3579,6 @@ def debug_print_joint_retargeting_alignment(
         ),
         flush=True,
     )
-    if "rh_THJ2" in joint_names:
-        thj2_value = float(output_qpos[joint_names.index("rh_THJ2")])
-        if thj2_value > 0.03:
-            print(
-                f"  hint: rh_THJ2 is positive ({thj2_value:+.3f}). "
-                "For a more natural x2 thumb pinch, try --thumb-natural-limits "
-                "or --retarget-joint-limit rh_THJ2=-1.31:0.0.",
-                flush=True,
-            )
-    if "rh_THJ3" in joint_names:
-        thj3_value = float(output_qpos[joint_names.index("rh_THJ3")])
-        if thj3_value > 0.03:
-            print(
-                f"  hint: rh_THJ3 is positive ({thj3_value:+.3f}). "
-                "For right-hand x2 thumb basal flexion, palm-side bending should "
-                "be negative, but a small positive extension is allowed to avoid "
-                "stiff offsets. Try --retarget-joint-limit rh_THJ3=-0.95:0.12.",
-                flush=True,
-            )
 
     vectors = compute_retargeting_robot_vectors(retargeting, output_qpos)
     if vectors is None:
@@ -2284,6 +3604,22 @@ def debug_print_joint_retargeting_alignment(
         f"(worst={worst_axis})",
         flush=True,
     )
+    print(
+        "  vector_axis_error_x="
+        f"{axis_mae[0]:.4f} "
+        "vector_axis_error_y="
+        f"{axis_mae[1]:.4f} "
+        "vector_axis_error_z="
+        f"{axis_mae[2]:.4f}",
+        flush=True,
+    )
+    print(f"  x2_left_y_axis_gain={x2_left_y_axis_gain:.2f}", flush=True)
+    if target_vector_axis_gains is not None:
+        print(
+            "  target_vector_axis_gain: "
+            + format_target_vector_axis_gains(retargeting, target_vector_axis_gains),
+            flush=True,
+        )
     if worst_axis == "y" and axis_mae[1] > 0.05:
         print(
             "  hint: y-axis target is larger than the robot can reach. "
@@ -2337,8 +3673,8 @@ def start_retargeting_mujoco(
     x2_retargeting_profile: str = "natural",
     x2_finger_direct_gain: Optional[str] = None,
     x2_finger_coupling_strength: float = 0.35,
-    x2_smooth_alpha: float = 0.65,
-    x2_max_delta: float = 0.18,
+    x2_smooth_alpha: float = X2_INTERNAL_QPOS_SMOOTH_ALPHA,
+    x2_max_delta: float = X2_INTERNAL_MAX_DELTA,
     x2_debug_dir: Optional[Path] = None,
     x2_debug_save_png: bool = False,
     finger_map: Optional[str] = None,
@@ -2350,7 +3686,7 @@ def start_retargeting_mujoco(
     lost_reset_frames: int = 5,
     root_joint_name: str = "mujoco_root_joint",
     root_pos: tuple[float, float, float] = (0.0, 0.0, -0.05),
-    root_quat: tuple[float, float, float, float] = X2_RIGHT_ROOT_QUAT,
+    root_quat: tuple[float, float, float, float] = X2_ROOT_QUAT,
     camera_distance: float = 0.65,
     camera_azimuth: float = X2_RIGHT_CAMERA_AZIMUTH,
     camera_elevation: float = -5.0,
@@ -2384,12 +3720,18 @@ def start_retargeting_mujoco(
     x2_default_vector_gain = ""
     x2_default_axis_gain = ""
     if x2_profile_active:
+        removed_thumb_objectives = remove_x2_thumb_hard_match_objectives(config)
         added_local_constraints = add_x2_local_shape_constraints(config)
         logger.warning(
             "x2 natural retargeting profile is active. "
             "It adds local finger constraints, x2-specific vector shaping, "
             "and natural joint limits."
         )
+        if removed_thumb_objectives:
+            logger.warning(
+                "x2 profile removed thumb hard-match objectives: "
+                + ", ".join(removed_thumb_objectives)
+            )
         if added_local_constraints:
             logger.warning(
                 "x2 profile added local finger constraints: "
@@ -2428,18 +3770,20 @@ def start_retargeting_mujoco(
 
     detector = SingleHandDetector(hand_type=hand_type, selfie=False)
     x2_control_mode = get_x2_control_mode(hand_type)
-    x2_left_output_mode = is_x2_config and hand_type == "Left"
-    if x2_left_output_mode:
-        if is_close_tuple(root_quat, X2_RIGHT_ROOT_QUAT):
-            root_quat = X2_LEFT_ROOT_QUAT
-        if abs(camera_azimuth - X2_RIGHT_CAMERA_AZIMUTH) < 1e-9:
-            camera_azimuth = X2_LEFT_CAMERA_AZIMUTH
+    x2_left_output_mode = is_x2_config and x2_control_mode == "left_mode"
+    x2_left_y_axis_gain = 1.0
+    if (
+        is_x2_config
+        and x2_control_mode == "left_mode"
+        and retargeting.optimizer.retargeting_type == "VECTOR"
+    ):
+        target_vector_axis_gains[:, 1] *= X2_LEFT_TARGET_VECTOR_Y_AXIS_GAIN
+        x2_left_y_axis_gain = X2_LEFT_TARGET_VECTOR_Y_AXIS_GAIN
 
     model_path = resolve_mujoco_model_path(config.urdf_path, mujoco_model_path)
     robot_name = model_path.stem
     if ref_transform is None and is_x2_robot(robot_name):
-        # X2 left/right use the same command-frame bending semantics; the
-        # world-space hand direction is mirrored by the MuJoCo root pose.
+        # X2 left/right share root pose; mode direction is expressed by qpos sign.
         ref_transform = "x2"
     if robot_visual_scale is not None:
         logger.warning(
@@ -2458,37 +3802,22 @@ def start_retargeting_mujoco(
         for i in range(model.njnt)
     ]
     qpos_addrs = build_qpos_addr_map(model, retargeting_joint_names)
-    x2_world_bend_command_signs = {
-        finger: 1.0 for finger in X2_FOUR_FINGER_DISTAL_BODIES
-    }
-    x2_world_bend_sign_diagnostics = {}
-    if is_x2_config:
-        (
-            x2_world_bend_command_signs,
-            x2_world_bend_sign_diagnostics,
-        ) = infer_x2_world_bend_command_signs(
+    x2_joint_sweep_rows = (
+        compute_x2_joint_sweep_rows(
             model,
             root_joint_name,
             root_pos,
             root_quat,
-            x2_control_mode,
             retargeting_joint_names,
         )
-    x2_left_signed_kinematics = False
-    x2_left_default_joint_signs = parse_joint_signs(
-        X2_LEFT_JOINT_SIGN, retargeting_joint_names
+        if is_x2_config
+        else []
     )
-    if x2_left_output_mode and joint_sign is None:
-        logger.warning(
-            "x2 left_mode is active. "
-            "Using direct MediaPipe finger-angle mapping for four fingers; "
-            "thumb remains independently retargeted."
-        )
     joint_signs = parse_joint_signs(joint_sign, retargeting_joint_names)
     joint_gains = parse_joint_gains(joint_gain, retargeting_joint_names)
     if thumb_natural_limits and not x2_profile_active:
         default_joint_limit_overrides.extend(
-            ["rh_THJ2=-1.31:0.0", "rh_THJ3=-0.95:0.12"]
+            ["rh_THJ3=-1.31:1.31", "rh_THJ2=-1.31:1.31", "rh_THJ1=-1.31:1.31"]
         )
     retarget_joint_limit = merge_joint_limit_overrides(
         user_retarget_joint_limit, default_joint_limit_overrides
@@ -2497,36 +3826,11 @@ def start_retargeting_mujoco(
         retargeting, retarget_joint_limit
     )
     output_joint_limits = get_signed_output_joint_limits(joint_limits, joint_signs)
-    x2_palm_flex_guard_enabled = x2_profile_active and joint_sign is None
-    if (
-        x2_left_output_mode
-        and joint_sign is not None
-        and np.array_equal(joint_signs, x2_left_default_joint_signs)
-    ):
-        enable_joint_sign_kinematics(retargeting, joint_signs)
-        set_retargeting_optimizer_limits(retargeting, output_joint_limits)
-        x2_left_signed_kinematics = True
-        logger.warning(
-            "x2 left-hand signed kinematics is active. "
-            "The optimizer now solves and MuJoCo displays the left-hand command qpos."
-        )
-    elif x2_left_output_mode and joint_sign is not None:
-        logger.warning(
-            "x2 left_mode is active, but custom --joint-sign does not "
-            f"match the default left bending mode ({X2_LEFT_JOINT_SIGN}). "
-            "Signed left-hand kinematics is disabled for this run."
-        )
-    x2_thumb_pinch_target_qpos = get_x2_thumb_pinch_target_qpos(hand_type)
-
-    if is_x2_robot(robot_name) and joint_sign is None and not x2_left_output_mode:
-        logger.warning(
-            "x2 detected. If the fingers bend in the opposite direction, try: "
-            "--joint-sign all=-1"
-        )
+    x2_four_finger_sign_enabled = is_x2_config
     if joint_sign is not None:
         logger.warning(
-            "--joint-sign is applied after optimization for visual diagnosis. "
-            "If it fixes x2 direction, bake the sign into the URDF joint axis or config."
+            "--joint-sign is an explicit post-retargeting output transform. "
+            "It is not part of the default x2 left/right mode convention."
         )
     if joint_gain is not None:
         logger.warning(
@@ -2553,6 +3857,17 @@ def start_retargeting_mujoco(
     if is_x2_config:
         logger.info(f"x2 control mode: {x2_control_mode} (single rh_* URDF)")
         logger.info(
+            "x2 control convention:\n"
+            "  * use_same_root_pose: True\n"
+            "  * use_left_root_mirror: False\n"
+            "  * right_mode_finger_sign: +1\n"
+            "  * left_mode_finger_sign: -1\n"
+            f"  * left_adapter_enabled: {x2_control_mode == 'left_mode'}\n"
+            "  * x2_flip_yz_enabled: False\n"
+            "  * auto_command_sign_flip: False\n"
+            f"  * joint_sign_arg_enabled: {joint_sign is not None}"
+        )
+        logger.info(
             "x2 landmark canonicalization: "
             + format_x2_landmark_canonicalization(
                 {
@@ -2560,30 +3875,33 @@ def start_retargeting_mujoco(
                     "source": "palm_frame",
                     "palm_frame": True,
                     "left_adapter": x2_control_mode == "left_mode",
-                    "mirror": tuple(float(value) for value in X2_LEFT_LANDMARK_MIRROR),
+                    "adapter": tuple(float(value) for value in X2_LEFT_PALM_FRAME_ADAPTER),
                     "semantic_map": X2_LANDMARK_SEMANTIC_MAP,
                 }
             )
         )
         logger.info(
-            "x2 palm flex guard: "
-            + ("enabled" if x2_palm_flex_guard_enabled else "disabled")
+            "x2 four-finger mode sign: "
+            f"{get_x2_four_finger_command_sign(x2_control_mode):+.0f}"
         )
         logger.info(
             f"x2 command smoothing: alpha={x2_smooth_alpha:.2f}, "
             f"max_delta={x2_max_delta:.3f} rad/frame"
         )
         logger.info(
-            "x2 world bend command signs: "
-            + format_x2_world_bend_command_signs(
-                x2_world_bend_sign_diagnostics, x2_control_mode
-            )
+            "x2 joint sweep four fingers (print only, no sign correction): "
+            + format_x2_four_finger_joint_sweep(x2_joint_sweep_rows)
+        )
+        logger.info(
+            "x2 thumb joint sweep (print only, same root for both modes): "
+            + format_x2_thumb_joint_sweep(x2_joint_sweep_rows)
         )
         if x2_profile_active and x2_control_mode == "left_mode":
             logger.info(
                 "x2 left mode uses the common x2 natural joint limits; "
                 "no image/example-specific left limits are applied."
             )
+        if x2_profile_active:
             logger.info(
                 "x2 finger direct gain scale: "
                 + format_x2_finger_direct_gain(x2_finger_direct_gains)
@@ -2594,33 +3912,14 @@ def start_retargeting_mujoco(
                 f"pip={X2_FINGER_COUPLING_PIP_PER_MCP:.2f}*mcp, "
                 f"dip={X2_FINGER_COUPLING_DIP_PER_PIP:.2f}*pip"
             )
+        logger.info(f"x2 left y-axis target vector gain: {x2_left_y_axis_gain:.2f}")
         if x2_debug_dir is not None:
             logger.info(
                 f"x2 debug artifacts: {x2_debug_dir} "
                 f"(png={'on' if x2_debug_save_png else 'off'})"
             )
-    if x2_profile_active:
-        logger.info(
-            "x2 thumb pinch target: "
-            + format_x2_thumb_pinch_target_qpos(x2_thumb_pinch_target_qpos)
-        )
     if is_x2_config:
-        logger.info(
-            "x2 command mode: "
-            + (
-                "legacy left signed joint-sign diagnosis"
-                if x2_left_signed_kinematics
-                else "direct qpos"
-            )
-        )
-        if x2_left_signed_kinematics:
-            logger.info(
-                "x2 kinematic signs: "
-                + ", ".join(
-                    f"{name}:{sign:+.0f}"
-                    for name, sign in zip(retargeting_joint_names, joint_signs)
-                )
-            )
+        logger.info("x2 command mode: direct qpos")
     logger.info("Target link mapping:\n" + format_link_human_mapping(retargeting))
     logger.info(
         "Joint signs: "
@@ -2660,7 +3959,13 @@ def start_retargeting_mujoco(
     x2_thumb_direct_state = X2ThumbDirectMappingState()
     x2_finger_direct_state = X2FingerDirectMappingState()
     x2_command_smoother = X2CommandSmoother(
-        alpha=x2_smooth_alpha, max_delta=x2_max_delta
+        alpha=x2_smooth_alpha,
+        max_delta=x2_max_delta,
+        deadband_mask=(
+            build_x2_four_finger_deadband_mask(retargeting_joint_names)
+            if is_x2_config
+            else None
+        ),
     )
     x2_debug_recorder = X2DebugRecorder(
         Path(x2_debug_dir) if x2_debug_dir is not None else None,
@@ -2669,7 +3974,13 @@ def start_retargeting_mujoco(
         save_png=x2_debug_save_png,
     )
     if is_x2_config:
-        x2_debug_recorder.write_joint_sweep(model, root_joint_name, root_pos)
+        x2_debug_recorder.write_joint_sweep(
+            model,
+            root_joint_name,
+            root_pos,
+            root_quat,
+            rows=x2_joint_sweep_rows,
+        )
 
     def process_frame() -> bool:
         nonlocal frame_id, lost_frames
@@ -2704,6 +4015,8 @@ def start_retargeting_mujoco(
         if joint_pos is None:
             lost_frames += 1
             logger.warning(f"{hand_type} hand is not detected.")
+            if x2_profile_active:
+                x2_thumb_direct_state.mark_hand_lost()
             if reset_on_hand_lost and lost_frames == max(lost_reset_frames, 1):
                 reset_retargeting_pose_mujoco(
                     retargeting,
@@ -2764,6 +4077,7 @@ def start_retargeting_mujoco(
                     x2_retargeting_profile,
                     retargeting_joint_names,
                     joint_limits,
+                    x2_control_mode,
                 )
                 if x2_profile_active
                 else {"enabled": False}
@@ -2787,6 +4101,13 @@ def start_retargeting_mujoco(
                 x2_retargeting_profile if is_x2_config else None,
                 x2_finger_direct_info,
             )
+            pre_sign_profiled_qpos = profiled_qpos.copy()
+            profiled_qpos = apply_x2_four_finger_control_sign(
+                profiled_qpos,
+                retargeting_joint_names,
+                x2_four_finger_sign_enabled,
+                x2_control_mode,
+            )
             profiled_qpos, x2_finger_coupling_info = apply_x2_four_finger_coupling(
                 profiled_qpos,
                 retargeting_joint_names,
@@ -2799,70 +4120,55 @@ def start_retargeting_mujoco(
                 retargeting_joint_names,
                 x2_retargeting_profile if is_x2_config else None,
                 x2_thumb_direct_info,
-            )
-            profiled_qpos = apply_x2_thumb_pinch_synergy(
-                profiled_qpos,
-                retargeting_joint_names,
-                joint_limits,
-                x2_retargeting_profile if is_x2_config else None,
-                x2_pinch_strength,
-                x2_thumb_pinch_target_qpos,
-                preserve_joints={"rh_THJ2", "rh_THJ1"}
-                if x2_thumb_direct_info.get("calibrated")
-                else None,
-            )
-            profiled_qpos, x2_open_relax_info = apply_x2_open_hand_relaxation(
-                profiled_qpos,
-                retargeting_joint_names,
-                x2_retargeting_profile if is_x2_config else None,
-                joint_pos,
-                x2_pinch_strength,
-            )
-            unguarded_profiled_qpos = profiled_qpos.copy()
-            profiled_qpos = apply_x2_palm_flex_guard(
-                profiled_qpos,
-                retargeting_joint_names,
-                x2_palm_flex_guard_enabled,
                 x2_control_mode,
+                retargeting=retargeting,
+                target_ref_value=ref_value,
+                joint_limits=joint_limits,
             )
-            if x2_left_signed_kinematics:
-                command_qpos = np.clip(
-                    profiled_qpos * joint_gains,
-                    output_joint_limits[:, 0],
-                    output_joint_limits[:, 1],
-                )
-            else:
-                command_qpos = apply_joint_output_transform(
-                    profiled_qpos,
-                    joint_signs,
-                    joint_gains,
-                    output_joint_limits,
-                )
-            command_qpos = apply_x2_world_bend_command_signs(
-                command_qpos,
-                retargeting_joint_names,
-                x2_world_bend_command_signs,
-                x2_profile_active
-                and joint_sign is None
-                and not x2_left_signed_kinematics,
+            command_qpos = apply_joint_output_transform(
+                profiled_qpos,
+                joint_signs,
+                joint_gains,
+                output_joint_limits,
             )
             command_qpos = np.clip(
                 command_qpos, output_joint_limits[:, 0], output_joint_limits[:, 1]
             )
+            command_qpos_before_smoothing = command_qpos.copy()
             if x2_profile_active:
+                if x2_thumb_direct_info.get("thumb_feature_ema_reset", False):
+                    reset_x2_thumb_smoother_state_to_command(
+                        x2_command_smoother,
+                        command_qpos,
+                        retargeting_joint_names,
+                    )
                 command_qpos, x2_smoothing_info = x2_command_smoother.update(
                     command_qpos
+                )
+                command_qpos = enforce_x2_thj4_gate_after_smoothing(
+                    command_qpos,
+                    retargeting_joint_names,
+                    x2_thumb_direct_info,
+                    x2_command_smoother,
                 )
             else:
                 x2_smoothing_info = {"enabled": False}
             model_qpos = command_qpos
             if x2_profile_active:
+                x2_thumb_direct_info["selected_thumb_qpos_after_smoothing"] = (
+                    x2_thumb_qpos_map(command_qpos, retargeting_joint_names)
+                )
+                x2_thumb_direct_info["final_mujoco_thumb_qpos"] = x2_thumb_qpos_map(
+                    model_qpos, retargeting_joint_names
+                )
+                x2_thumb_direct_info["selected_thumb_qpos_before_output_smoothing"] = (
+                    x2_thumb_qpos_map(command_qpos_before_smoothing, retargeting_joint_names)
+                )
+            if x2_profile_active:
                 state_qpos = np.clip(
                     profiled_qpos, joint_limits[:, 0], joint_limits[:, 1]
                 )
-                retargeting.set_qpos(
-                    command_qpos if x2_left_signed_kinematics else state_qpos
-                )
+                retargeting.set_qpos(state_qpos)
             data.qpos[qpos_addrs] = model_qpos
             mujoco.mj_forward(model, data)
             if debug_retargeting and frame_id % max(debug_interval, 1) == 0:
@@ -2888,6 +4194,8 @@ def start_retargeting_mujoco(
                     data,
                     output_joint_limits,
                     debug_limit_margin,
+                    target_vector_axis_gains=target_vector_axis_gains,
+                    x2_left_y_axis_gain=x2_left_y_axis_gain,
                 )
                 x2_world_dx = {}
                 if is_x2_config:
@@ -2918,7 +4226,7 @@ def start_retargeting_mujoco(
                     print(
                         "  left solver qpos:",
                         format_qpos_by_finger(
-                            retargeting_joint_names, unguarded_profiled_qpos
+                            retargeting_joint_names, pre_sign_profiled_qpos
                         ),
                         flush=True,
                     )
@@ -2927,11 +4235,11 @@ def start_retargeting_mujoco(
                         format_qpos_by_finger(retargeting_joint_names, command_qpos),
                         flush=True,
                     )
-                if x2_palm_flex_guard_enabled:
+                if x2_four_finger_sign_enabled:
                     print(
-                        "  x2 palm flex guard:",
-                        format_x2_palm_flex_guard_changes(
-                            unguarded_profiled_qpos,
+                        "  x2 four-finger mode sign:",
+                        format_x2_four_finger_sign_changes(
+                            pre_sign_profiled_qpos,
                             profiled_qpos,
                             retargeting_joint_names,
                         ),
@@ -2969,18 +4277,6 @@ def start_retargeting_mujoco(
                         flush=True,
                     )
                     print(
-                        "  x2 world bend command signs: "
-                        + format_x2_world_bend_command_signs(
-                            x2_world_bend_sign_diagnostics, x2_control_mode
-                        ),
-                        flush=True,
-                    )
-                    print(
-                        "  x2 open hand relax: "
-                        + format_x2_open_hand_relaxation(x2_open_relax_info),
-                        flush=True,
-                    )
-                    print(
                         "  x2 thumb direct mapping: "
                         + format_x2_thumb_direct_mapping(x2_thumb_direct_info),
                         flush=True,
@@ -2988,8 +4284,8 @@ def start_retargeting_mujoco(
                     if (
                         x2_thumb_direct_info.get("calibrated")
                         and max(
-                            x2_thumb_direct_info["flexion_deg"].get("rh_THJ2", 0.0),
-                            x2_thumb_direct_info["flexion_deg"].get("rh_THJ1", 0.0),
+                            x2_thumb_direct_info["control_amount"].get("rh_THJ2", 0.0),
+                            x2_thumb_direct_info["control_amount"].get("rh_THJ1", 0.0),
                         )
                         > 8.0
                         and max(
@@ -3036,8 +4332,7 @@ def start_retargeting_mujoco(
     if viewer_backend in {"glfw", "mujoco"}:
         with launch_mujoco_viewer(model, data, glfw_context_api) as viewer:
             viewer.cam.distance = camera_distance
-            # x2 right-hand palm local +Y maps to world +X; left-hand maps to
-            # world -X. The default camera azimuth follows that handedness.
+            # X2 left/right modes share the same root orientation.
             viewer.cam.azimuth = camera_azimuth
             viewer.cam.elevation = camera_elevation
 
@@ -3105,8 +4400,8 @@ def main(
     x2_retargeting_profile: str = "natural",
     x2_finger_direct_gain: Optional[str] = None,
     x2_finger_coupling_strength: float = 0.35,
-    x2_smooth_alpha: float = 0.65,
-    x2_max_delta: float = 0.18,
+    x2_smooth_alpha: float = X2_INTERNAL_QPOS_SMOOTH_ALPHA,
+    x2_max_delta: float = X2_INTERNAL_MAX_DELTA,
     x2_debug_dir: Optional[Path] = None,
     x2_debug_save_png: bool = False,
     finger_map: Optional[str] = None,
@@ -3117,7 +4412,7 @@ def main(
     reset_on_hand_lost: bool = True,
     lost_reset_frames: int = 5,
     root_pos: tuple[float, float, float] = (0.0, 0.0, -0.05),
-    root_quat: tuple[float, float, float, float] = X2_RIGHT_ROOT_QUAT,
+    root_quat: tuple[float, float, float, float] = X2_ROOT_QUAT,
     camera_distance: float = 0.65,
     camera_azimuth: float = X2_RIGHT_CAMERA_AZIMUTH,
     camera_elevation: float = -5.0,
@@ -3131,14 +4426,6 @@ def main(
         raise ValueError(
             f"No default config found for {robot_name}-{retargeting_type}-{hand_type}."
         )
-    if robot_name == RobotName.x2 and hand_type == HandType.left:
-        if is_close_tuple(root_quat, X2_RIGHT_ROOT_QUAT):
-            root_quat = X2_LEFT_ROOT_QUAT
-        if abs(camera_azimuth - X2_RIGHT_CAMERA_AZIMUTH) < 1e-9:
-            camera_azimuth = X2_LEFT_CAMERA_AZIMUTH
-    # X2 left mode uses world -X as both the palm normal and the expected
-    # finger-closing direction.
-
     robot_dir = get_robot_dir()
     queue = multiprocessing.Queue(maxsize=1)
     error_queue = multiprocessing.Queue(maxsize=1)

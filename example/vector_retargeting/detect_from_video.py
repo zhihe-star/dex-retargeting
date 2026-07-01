@@ -16,6 +16,7 @@ from dex_retargeting.retargeting_config import RetargetingConfig
 from dex_retargeting.seq_retarget import SeqRetargeting
 from single_hand_detector import SingleHandDetector
 from show_realtime_retargeting import (
+    apply_x2_four_finger_control_sign,
     apply_joint_output_transform,
     canonicalize_x2_landmarks_for_control_mode,
     get_x2_control_mode,
@@ -109,6 +110,12 @@ def retarget_video(
                     )
                 ref_value = transform_ref_value(ref_value, ref_transform)
                 qpos = retargeting.retarget(ref_value)
+                qpos = apply_x2_four_finger_control_sign(
+                    qpos,
+                    retargeting.joint_names,
+                    x2_mode,
+                    x2_control_mode,
+                )
                 qpos = apply_joint_output_transform(
                     qpos, joint_signs, joint_gains, output_joint_limits
                 )
@@ -119,6 +126,9 @@ def retarget_video(
             config_path=config_path,
             hand_type=hand_type.name,
             x2_joint_sign=joint_sign or "default",
+            x2_control_mode=x2_control_mode,
+            x2_use_same_root_pose=True,
+            x2_auto_command_sign_flip=False,
             frame_indices=frame_indices,
             dof=len(retargeting.optimizer.robot.dof_joint_names),
             joint_names=retargeting.optimizer.robot.dof_joint_names,
